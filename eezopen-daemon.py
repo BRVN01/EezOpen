@@ -2150,6 +2150,71 @@ def flush_storage(root: Path) -> None:
         os.sync()
 
 
+def _mounted_block_for_root(root: Path) -> Optional[str]:
+    """Return the block device currently mounted at ``root`` (for example /dev/sda)."""
+    target = Path(root)
+    for item in _lsblk_records():
+        for mountpoint in _mountpoints(item):
+            if mountpoint == target:
+                name = str(item.get("name") or "").strip()
+                if name:
+                    return name
+    return None
+
+
+def unmount_storage(root: Path) -> None:
+    """Unmount the MacroPad MSC volume after a completed/flush-safe write.
+
+    EezOpen deliberately unmounts even when the volume was already mounted before
+    the write.  This keeps the FAT filesystem clean so the MacroPad can be
+    physically disconnected after a successful Configurator write without
+    leaving the volume dirty.  CDC/HID remain connected; only the MSC filesystem
+    mount is released.
+    """
+    root = Path(root)
+    device = _mounted_block_for_root(root)
+
+    # If the device disappeared or another actor already unmounted it, treat the
+    # requested post-write state as satisfied and clear stale daemon state.
+    if device is None:
+        LOG.info("USB storage already unmounted after write: %s", root)
+    else:
+        if shutil.which("udisksctl"):
+            cmd = ["udisksctl", "unmount", "-b", device]
+        elif shutil.which("umount"):
+            cmd = ["umount", str(root)]
+        else:
+            raise RuntimeError(
+                "USB write completed, but automatic unmount is unavailable "
+                "(udisksctl/umount not found)"
+            )
+
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True, timeout=12, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"USB write completed, but automatic unmount failed for {device}: "
+                f"{proc.stdout.strip()}"
+            )
+        LOG.info("USB storage unmounted after successful write: device=%s root=%s",
+                 device, root)
+
+    with STATE_LOCK:
+        if STATE.get("storage_root") == str(root):
+            STATE["storage_root"] = None
+        source = STATE.get("source_dir")
+        if source and str(source).startswith(str(root) + os.sep):
+            STATE["source_dir"] = None
+        STATE["storage_ready"] = False
+        STATE["storage_error"] = None
+
+
+def flush_and_unmount_storage(root: Path) -> None:
+    """Make MacroPad writes durable, then always release the mounted FAT volume."""
+    flush_storage(root)
+    unmount_storage(root)
+
+
 def current_config_dir() -> Optional[Path]:
     with STATE_LOCK:
         raw = STATE.get("view_config_dir") if STATE.get("connected") else None
@@ -2299,7 +2364,7 @@ def save_hid_key_config(profile: int, key: int, alias: str, actions: Any,
         icon_result = copy_key_icon(profile, key, icon_path, clear_icon, root)
         if root is not None:
             LOG.info("USB HID config written: %s", source / filename)
-            flush_storage(root)
+            flush_and_unmount_storage(root)
             # Same save cadence captured before the serial HID-mode write.
             time.sleep(0.30)
 
@@ -2376,7 +2441,7 @@ def save_key_config(profile: int, key: int, alias: str, act: str, arg: str,
         icon_result = copy_key_icon(profile, key, icon_path, clear_icon, root)
         if root is not None:
             LOG.info("USB config written: %s", source / filename)
-            flush_storage(root)
+            flush_and_unmount_storage(root)
             # Official capture: icon close -> b<profile>.<key> was ~297 ms.
             time.sleep(0.30)
 
@@ -2460,7 +2525,7 @@ def delete_key_config(profile: int, key: int) -> dict[str, Any]:
                 path.unlink()
                 removed_device += 1
 
-        flush_storage(root)
+        flush_and_unmount_storage(root)
 
         # Do not invent a new "delete key" opcode.  Use the two commands already
         # confirmed by normal saves: b disables HID/returns the key to host-side
@@ -2577,11 +2642,16 @@ def push_to_device() -> dict[str, Any]:
         scripts_removed = _remove_device_extras(local_scripts, dst_scripts, "profile_*_key_*.txt")
         icons_removed = _remove_device_extras(local_icons, dst_icons, "profile_*_key_*.png")
 
-        flush_storage(root)
+        # Refresh the ephemeral view while the filesystem is still mounted.
+        # The persistent HOME cache remains the source of truth.
+        if device_id:
+            _sync_device_view_from_root(root, device_id)
+
+        flush_and_unmount_storage(root)
         time.sleep(0.30)
 
-        # Apply serial state only after every config/icon is durable on the MSC
-        # volume. This mirrors the ordering observed in the official save flow.
+        # Apply serial state only after every config/icon is durable and the FAT
+        # volume has been cleanly unmounted.
         for p, k, alias, filename, is_hid in pending_serial:
             try:
                 if is_hid:
@@ -2593,14 +2663,6 @@ def push_to_device() -> dict[str, Any]:
             except Exception as exc:
                 serial_errors.append(f"{filename}: {exc}")
 
-    # Refresh only the ephemeral device view so the GUI immediately reflects
-    # what was just pushed.  The persistent home cache remains the source.
-    if device_id:
-        _sync_device_view_from_root(root, device_id)
-
-    with STATE_LOCK:
-        STATE["storage_root"] = str(root)
-        STATE["source_dir"] = str(source)
     return {"ok": True, "configs_written": written, "scripts_written": scripts_written,
             "icons_written": icons_written, "configs_removed": configs_removed,
             "scripts_removed": scripts_removed, "icons_removed": icons_removed,
@@ -3130,7 +3192,7 @@ def remove_background() -> dict[str, Any]:
             except FileNotFoundError:
                 continue
             removed.append(filename)
-        flush_storage(root)
+        flush_and_unmount_storage(root)
 
     LOG.info("Background files removed from MacroPad: %s", removed or "none present")
     return {"ok": True, "removed": removed, "storage_root": str(root)}
@@ -3169,7 +3231,7 @@ def install_background(bin_path: str, theme: str) -> dict[str, Any]:
         root = ensure_device_storage(try_mount=True)
         destination = root / "app_icons" / filename
         copy_device_file_direct(source, destination)
-        flush_storage(root)
+        flush_and_unmount_storage(root)
 
     LOG.info("Background installed: theme=%s source=%s destination=%s", theme, source, destination)
     return {
@@ -3282,13 +3344,9 @@ def firmware_update(bin_path: str, json_path: str) -> dict[str, Any]:
         if sha256(json_src) != sha256(dst_json):
             raise RuntimeError("Verification failed: mc-08.json on the MacroPad differs from the source")
 
-        if shutil.which("sync"):
-            proc = subprocess.run(["sync", "-f", str(root)], stdout=subprocess.PIPE,
-                                  stderr=subprocess.STDOUT, text=True, timeout=10, check=False)
-            if proc.returncode != 0:
-                raise RuntimeError(f"sync -f failed: {proc.stdout.strip()}")
-        else:
-            os.sync()
+        # Firmware files must be fully durable and the FAT volume cleanly
+        # unmounted before asking the device to reboot into update mode.
+        flush_and_unmount_storage(root)
 
         # Arm the guard *before* closing the runtime descriptor, so the main
         # reconnect loop cannot race us and open recovery mode.

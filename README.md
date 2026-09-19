@@ -1,3 +1,50 @@
+## Table of Contents
+
+- [What is the EezBotFun 8-Key MacroPad?](#what-is-the-eezbotfun-8-key-macropad)
+- [Why EezOpen?](#why-eezopen)
+- [Highlights](#highlights)
+- [Profiles and MacroPad synchronization](#profiles-and-macropad-synchronization)
+- [Key configuration](#key-configuration)
+  - [HID Mode](#hid-mode)
+  - [Linux-side actions](#linux-side-actions)
+- [External Scripts](#external-scripts)
+- [Key icons](#key-icons)
+- [RGB backlight](#rgb-backlight)
+- [MacroPad theme](#macropad-theme)
+- [Custom background images](#custom-background-images)
+- [Screen Scripts](#screen-scripts)
+  - [EezTop](#eeztop)
+  - [EezNet](#eeznet)
+  - [EezOBS Monitor](#eezobs-monitor)
+- [Firmware update](#firmware-update)
+- [Safe Mode](#safe-mode)
+- [Architecture](#architecture)
+- [Ubuntu / Debian](#ubuntu--debian)
+  - [Logs](#logs)
+- [Optional dependencies for example scripts](#optional-dependencies-for-example-scripts)
+  - [EezOBS Monitor setup](#eezobs-monitor-1)
+- [Basic usage](#basic-usage)
+- [Security model](#security-model)
+- [Compatibility and project scope](#compatibility-and-project-scope)
+- [Technical notes](#technical-notes)
+- [Security and Blue-Team Assessment](#security-and-blue-team-assessment)
+  - [Scope, EezOpen and responsibility](#scope-eezopen-and-responsibility)
+  - [Assessment scope](#assessment-scope)
+  - [Vendor-provided context](#vendor-provided-context)
+  - [USB interfaces](#usb-interfaces)
+  - [BadUSB / automatic HID injection](#badusb--automatic-hid-injection)
+  - [Official Configurator](#official-configurator)
+  - [PC monitoring component](#pc-monitoring-component)
+  - [Host-side execution and trust boundaries](#host-side-execution-and-trust-boundaries)
+  - [Web Configurator and network traffic](#web-configurator-and-network-traffic)
+  - [Firmware](#firmware)
+  - [Firmware update behavior](#firmware-update-behavior)
+  - [Current assessment](#current-assessment)
+  - [Remaining areas of interest](#remaining-areas-of-interest)
+- [Contributing](#contributing)
+- [Project relationship](#project-relationship)
+- [License](#license)
+
 <h1 align="center">EezOpen</h1>
 
 <p align="center">
@@ -17,6 +64,7 @@
 <p align="center">
   <img src=".images/eezopen.png" alt="EezOpen GTK4 Configurator" width="880">
 </p>
+
 
 ## What is the EezBotFun 8-Key MacroPad?
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-EezOpen Config v2.1.0 - GTK4 configurator - For the EezBotFun 8-Key MacroPad
+EezOpen Config v2.2.3 - GTK4 configurator - For the EezBotFun 8-Key MacroPad
 
 Part of the EezOpen project.
 
@@ -141,6 +141,35 @@ def set_widget_description(widget: Gtk.Widget, text: str) -> None:
     # from ever expiring.
     if widget.get_tooltip_text() != target:
         widget.set_tooltip_text(target)
+
+def show_error_dialog(parent: Gtk.Window, title: str, message: object) -> None:
+    """Show an unmistakable modal error for a user-initiated operation.
+
+    The status/notice labels remain useful as a history of the last operation,
+    but failures that require user action must not be visible only there (or only
+    in the daemon journal).
+    """
+    detail = str(message or "Unknown error").strip() or "Unknown error"
+    dialog = Gtk.MessageDialog(
+        transient_for=parent,
+        modal=True,
+        message_type=Gtk.MessageType.ERROR,
+        buttons=Gtk.ButtonsType.CLOSE,
+        text=f"{title}\n\n{detail}",
+    )
+    dialog.connect("response", lambda d, _response: d.destroy())
+    dialog.present()
+
+
+def screen_script_storage_error(status: dict) -> str | None:
+    """Return a user-facing reason when a Screen Script owns device I/O."""
+    if not bool(status.get("screen_script_active")):
+        return None
+    name = str(status.get("screen_script_name") or "Screen Script").strip() or "Screen Script"
+    return (
+        f"{name} is currently running. Stop the Screen Script before changing "
+        "MacroPad files or settings that require USB Mass Storage."
+    )
 
 BACKGROUND_TMP_DIR = Path("/tmp/eezopen")
 BACKGROUND_FILENAMES = {"dark": "bg_dark.bin", "light": "bg_light.bin"}
@@ -478,7 +507,7 @@ class KeyEditor(Gtk.Window):
 
         self.external_script_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8); self.nonhid_box.append(self.external_script_box)
         script_title = Gtk.Label(); script_title.set_markup("<b>External Script</b>"); script_title.set_xalign(0); self.external_script_box.append(script_title)
-        script_hint = Gtk.Label(label="Runs an external executable or script directly with shell=False. Arguments are parsed as argv; quotes may group values with spaces.")
+        script_hint = Gtk.Label(label="Runs an external executable or script directly with shell=False. On the MacroPad this is stored as the standard ACT 2 action; EezOpen keeps the External Script distinction only in its HOME cache. Arguments are parsed as argv; quotes may group values with spaces.")
         script_hint.set_xalign(0); script_hint.set_wrap(True); script_hint.add_css_class("dim-label"); self.external_script_box.append(script_hint)
         script_grid = Gtk.Grid(column_spacing=10, row_spacing=10); self.external_script_box.append(script_grid)
         script_label = Gtk.Label(label="Script:"); script_label.set_xalign(1); script_grid.attach(script_label, 0, 0, 1, 1)
@@ -773,8 +802,15 @@ class KeyEditor(Gtk.Window):
         ipc_async({"cmd": "test_external_script", "script": script, "arguments": arguments}, ok, fail, timeout=32.0)
 
     def on_delete(self, *_args):
+        screen_reason = screen_script_storage_error(self.parent_window.current_status)
+        if screen_reason:
+            self.status_label.set_text(screen_reason)
+            show_error_dialog(self, "Cannot remove configuration", screen_reason)
+            return
         if self.parent_window.current_status.get("storage_guarded"):
-            self.status_label.set_text("Removing a key from the physical MacroPad requires USB storage, which is unavailable in Safe Mode.")
+            message = "Removing a key from the physical MacroPad requires USB storage, which is unavailable in Safe Mode."
+            self.status_label.set_text(message)
+            show_error_dialog(self, "Cannot remove configuration", message)
             return
         dialog = Gtk.MessageDialog(
             transient_for=self,
@@ -808,7 +844,9 @@ class KeyEditor(Gtk.Window):
             return False
 
         def fail(exc):
-            self.status_label.set_text(f"Failed to remove configuration: {exc}")
+            message = f"Failed to remove configuration: {exc}"
+            self.status_label.set_text(message)
+            show_error_dialog(self, "Cannot remove configuration", exc)
             return False
 
         ipc_async({"cmd": "delete_key", "profile": self.profile, "key": self.key},
@@ -816,7 +854,19 @@ class KeyEditor(Gtk.Window):
 
     def on_save(self, *_args):
         hid = self.hid_check.get_active()
-        guarded = bool(self.parent_window.current_status.get("storage_guarded"))
+        status = self.parent_window.current_status
+        screen_reason = screen_script_storage_error(status)
+        if screen_reason and bool(status.get("connected")):
+            self.status_label.set_text(screen_reason)
+            show_error_dialog(self, "Cannot save configuration", screen_reason)
+            return
+        if status.get("storage_quarantined") and bool(status.get("connected")):
+            reason = str(status.get("storage_quarantine_reason") or "An incomplete USB Mass Storage operation was detected.")
+            message = f"{reason} Reconnect the MacroPad before saving to it."
+            self.status_label.set_text(message)
+            show_error_dialog(self, "Cannot save configuration", message)
+            return
+        guarded = bool(status.get("storage_guarded"))
         if hid and guarded:
             self.status_label.set_text("HID script changes require the MacroPad USB volume and are unavailable in Safe Mode. Existing HID keys continue to work.")
             return
@@ -875,7 +925,10 @@ class KeyEditor(Gtk.Window):
                     notes.append("Icon removed." if result.get("icon_removed") else "64×64 PNG icon written.")
             notes.append("Mode/alias sent over serial." if result.get("serial_applied") else f"Serial: {result.get('serial_error') or 'not applied'}")
             self.parent_window.set_notice(" ".join(notes)); self.parent_window.update_status(); self.parent_window.refresh_profile(); self.close(); return False
-        def fail(exc): self.status_label.set_text(f"Failed to save configuration: {exc}"); return False
+        def fail(exc):
+            self.status_label.set_text(f"Failed to save configuration: {exc}")
+            show_error_dialog(self, "Cannot save configuration", exc)
+            return False
         ipc_async(payload, ok, fail, timeout=20.0)
 
 
@@ -1029,6 +1082,7 @@ class FirmwareWindow(Gtk.Window):
             return False
         def fail(exc):
             self.status.set_text(f"Failed: {exc}")
+            show_error_dialog(self, "Firmware update failed", exc)
             return False
         ipc_async({"cmd": "firmware_update", "bin_path": self.bin_path, "json_path": self.json_path}, ok, fail, timeout=30.0)
 
@@ -1056,6 +1110,12 @@ class MainWindow(Gtk.ApplicationWindow):
         self.screen_script_file_chooser: Gtk.FileChooserNative | None = None
         self.screen_script_file_chooser_mode = "add"
         self.screen_script_request_pending = False
+        # Coalesce rapid profile clicks. Only one physical profile-switch IPC
+        # may be in flight; while storage is busy, keep only the newest target.
+        self.profile_switch_pending = False
+        self.profile_switch_target: int | None = None
+        self.profile_switch_retry_scheduled = False
+        self.background_apply_pending = False
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0); self.set_child(root)
 
@@ -1183,7 +1243,7 @@ class MainWindow(Gtk.ApplicationWindow):
             self.key_buttons[key] = button; grid.attach(button, (key - 1) % 4, (key - 1) // 4, 1, 1); self.set_key_button(key, None)
 
         self.notice_label = Gtk.Label(); self.notice_label.set_xalign(0); self.notice_label.set_wrap(True); content.append(self.notice_label)
-        self.footer = Gtk.Label(label="Save writes the configuration to the persistent cache and, when storage is available, to the MacroPad USB volume. Mode/alias are applied over serial. Icons are normalized to 64×64 PNG.")
+        self.footer = Gtk.Label(label="Save serializes Mass Storage and CDC access: the USB volume is mounted only for the file operation, flushed/unmounted, then mode/alias is applied over serial. Icons are normalized to 64×64 PNG.")
         self.footer.set_xalign(0); self.footer.set_wrap(True); self.footer.add_css_class("dim-label"); content.append(self.footer)
 
         GLib.timeout_add(250, self.poll_status); GLib.idle_add(self.initial_load)
@@ -1226,9 +1286,9 @@ class MainWindow(Gtk.ApplicationWindow):
         self.update_status()
         self.refresh_profile_buttons()
         self.refresh_profile()
-        if self.current_status.get("connected") and not self.current_status.get("storage_guarded"):
-            # Recursive Mass Storage reads are Configurator-driven only.
-            self.on_pull()
+        # Deliberately do not touch MacroPad Mass Storage on window open.
+        # "Sync MacroPad" is an explicit operation so USB/SCSI startup cannot
+        # race background CDC telemetry or an automatic recursive FAT read.
         return False
 
     def poll_status(self):
@@ -1244,6 +1304,8 @@ class MainWindow(Gtk.ApplicationWindow):
         s = self.current_status
         guarded = bool(s.get("storage_guarded"))
         safe_mode = bool(s.get("safe_mode"))
+        storage_quarantined = bool(s.get("storage_quarantined"))
+        storage_busy = bool(s.get("storage_busy"))
         if guarded:
             tip = "USB Mass Storage is unavailable because the MacroPad is in Safe Mode. CDC/HID runtime features remain available." if safe_mode else "USB Mass Storage is currently unavailable."
             set_widget_description(self.pull_button, tip)
@@ -1253,6 +1315,16 @@ class MainWindow(Gtk.ApplicationWindow):
             set_widget_description(self.background_remove_button, tip)
             set_widget_description(self.firmware_button, tip)
             self.footer.set_text("Safe Mode: the firmware is not exposing USB Mass Storage. CDC/HID, profiles, RGB, Non-HID actions and PC Monitor remain available." if safe_mode else "USB Mass Storage is currently unavailable.")
+        elif storage_quarantined:
+            reason = str(s.get("storage_quarantine_reason") or "A Mass Storage request did not complete safely")
+            tip = reason + ". Reconnect the MacroPad before further USB/CDC writes."
+            set_widget_description(self.pull_button, tip)
+            set_widget_description(self.import_button, tip)
+            set_widget_description(self.push_button, tip)
+            set_widget_description(self.background_apply_button, tip)
+            set_widget_description(self.background_remove_button, tip)
+            set_widget_description(self.firmware_button, tip)
+            self.footer.set_text("MacroPad USB storage is quarantined after an incomplete operation. Reconnect the MacroPad before continuing.")
         else:
             set_widget_description(self.pull_button, "Reload the connected MacroPad into the temporary view without changing the persistent cache")
             set_widget_description(self.import_button, "Replace the persistent EezOpen cache with configs, scripts, and icons from the connected MacroPad")
@@ -1276,6 +1348,13 @@ class MainWindow(Gtk.ApplicationWindow):
             self.screen_script_run_button.set_label("Stop Screen Script" if screen_active else "Start Screen Script")
             self.screen_script_run_button.set_sensitive(bool(screen_active or self.screen_scripts))
         controls_enabled = not screen_active and not self.screen_script_request_pending
+        storage_controls_enabled = bool(s.get("connected")) and not guarded and not storage_quarantined and not storage_busy and not screen_active
+        self.pull_button.set_sensitive(storage_controls_enabled)
+        self.import_button.set_sensitive(storage_controls_enabled)
+        self.push_button.set_sensitive(storage_controls_enabled)
+        self.background_apply_button.set_sensitive(storage_controls_enabled and not self.background_apply_pending)
+        self.background_remove_button.set_sensitive(storage_controls_enabled)
+        self.firmware_button.set_sensitive(storage_controls_enabled)
         self.screen_script_dropdown.set_sensitive(controls_enabled and bool(self.screen_scripts))
         self.screen_script_add_button.set_sensitive(controls_enabled)
         self.screen_script_remove_button.set_sensitive(controls_enabled and bool(self.screen_scripts))
@@ -1289,13 +1368,26 @@ class MainWindow(Gtk.ApplicationWindow):
             name = str(s.get("screen_script_name") or (Path(remote_script).name if remote_script else "screen script"))
             self.device_label.set_text(
                 f"Screen Script running · {name} · PID {s.get('screen_script_pid') or '?'} · "
-                f"{s.get('screen_script_tty') or '?'} · serial commands active · PC Monitor paused"
+                f"{s.get('screen_script_tty') or '?'} · daemon CDC TX paused · PC Monitor paused"
             )
         elif s.get("connected"):
             self.status_dot.set_text("●")
-            storage = ("USB storage disabled (Safe Mode)" if safe_mode else "USB storage unavailable") if guarded else ("USB storage OK" if s.get("storage_ready") else "USB storage waiting")
+            if guarded:
+                storage = "USB storage disabled (Safe Mode)" if safe_mode else "USB storage unavailable"
+            elif storage_quarantined:
+                storage = "USB storage fault · reconnect MacroPad"
+            elif storage_busy:
+                storage = "USB storage active · operation in progress"
+            elif s.get("storage_ready"):
+                storage = "USB storage mounted"
+            else:
+                storage = "USB storage idle/unmounted"
             auth = "auth OK" if s.get("authenticated") else "auth not confirmed"
             self.device_label.set_text(f"Connected · type {s.get('type') or '?'} · {s.get('id') or '?'} · {s.get('device') or '?'} · {s.get('profile_count', 1)} profiles ({s.get('profile_count_source')}) · {auth} · {storage}")
+        elif s.get("startup_phase") not in {None, "waiting"}:
+            self.status_dot.set_text("◌")
+            detail = str(s.get("startup_detail") or s.get("startup_phase") or "USB startup")
+            self.device_label.set_text(f"MacroPad starting safely · {detail}")
         elif s.get("id"):
             self.status_dot.set_text("○"); self.device_label.set_text(f"MacroPad disconnected · cache {s.get('id')}")
         else:
@@ -1309,21 +1401,65 @@ class MainWindow(Gtk.ApplicationWindow):
             for k in range(1, 9): self.set_key_button(k, None)
             self.set_notice(f"Could not load profile: {exc}")
 
+    def _schedule_profile_switch_retry(self) -> None:
+        if self.profile_switch_retry_scheduled:
+            return
+        self.profile_switch_retry_scheduled = True
+        GLib.timeout_add(250, self._retry_profile_switch)
+
+    def _retry_profile_switch(self):
+        self.profile_switch_retry_scheduled = False
+        self._start_profile_switch()
+        return False
+
+    def _start_profile_switch(self) -> None:
+        if self.profile_switch_pending or self.profile_switch_target is None:
+            return
+        if not self.current_status.get("connected"):
+            self.profile_switch_target = None
+            return
+        if self.current_status.get("storage_quarantined"):
+            self.set_notice("MacroPad storage is quarantined after an incomplete USB operation. Reconnect the MacroPad before switching its physical profile.")
+            self.profile_switch_target = None
+            return
+        if self.current_status.get("storage_busy"):
+            # Keep only the newest requested profile and wait until the explicit
+            # MSC transaction is complete. Do not spawn a queue of IPC threads.
+            self._schedule_profile_switch_retry()
+            return
+
+        target = int(self.profile_switch_target)
+        self.profile_switch_target = None
+        self.profile_switch_pending = True
+
+        def finish_and_continue():
+            self.profile_switch_pending = False
+            self.update_status()
+            if self.profile_switch_target is not None:
+                self._start_profile_switch()
+
+        def ok(_result):
+            self.set_notice(f"MacroPad switched to profile {target}.")
+            finish_and_continue()
+            return False
+
+        def fail(exc):
+            self.set_notice(f"Profile {target} open in EezOpen, but the MacroPad could not be switched: {exc}")
+            finish_and_continue()
+            return False
+
+        ipc_async({"cmd": "activate_profile", "profile": target}, ok, fail, timeout=3.0)
+
     def on_profile_selected(self, _button, n):
         self.current_profile = n
         self.refresh_profile_buttons()
         self.refresh_profile()
-        # The official configurator changes the physical device profile when
-        # the editor profile changes. Keep the screen and the editor aligned.
         if self.current_status.get("connected"):
-            def ok(_result):
-                self.set_notice(f"MacroPad switched to profile {n}.")
-                self.update_status()
-                return False
-            def fail(exc):
-                self.set_notice(f"Profile {n} open in EezOpen, but the MacroPad could not be switched: {exc}")
-                return False
-            ipc_async({"cmd": "activate_profile", "profile": n}, ok, fail, timeout=3.0)
+            # Rapid clicks/scrolling only keep the newest physical target. This
+            # prevents dozens of concurrent activate_profile IPC workers when
+            # storage is slow or temporarily unavailable.
+            self.profile_switch_target = int(n)
+            self._start_profile_switch()
 
     def change_profile_count(self, delta: int):
         old = self.profile_count(); new = old + delta
@@ -1360,7 +1496,10 @@ class MainWindow(Gtk.ApplicationWindow):
             self.update_status(); self.refresh_profile_buttons(); self.refresh_profile()
             self.set_notice(f"Loaded into temporary device view: {r.get('configs')} configs; persistent home cache preserved" + (" + icons." if r.get("icons_synced") else "."))
             return False
-        def fail(exc): self.set_notice(f"Refresh failed: {exc}"); return False
+        def fail(exc):
+            self.set_notice(f"Refresh failed: {exc}")
+            show_error_dialog(self, "Sync MacroPad failed", exc)
+            return False
         ipc_async({"cmd": "pull_from_device"}, ok, fail, timeout=15.0)
 
     def on_import_from_device(self, *_):
@@ -1404,6 +1543,7 @@ class MainWindow(Gtk.ApplicationWindow):
 
             def fail(exc):
                 self.set_notice(f"Import failed: {exc}")
+                show_error_dialog(self, "Import from MacroPad failed", exc)
                 return False
 
             ipc_async({"cmd": "import_from_device"}, ok, fail, timeout=20.0)
@@ -1422,7 +1562,10 @@ class MainWindow(Gtk.ApplicationWindow):
             if r.get("icons_written"): msg += f", {r.get('icons_written')} icon files"
             if r.get("serial_errors"): msg += f". Errors: {len(r['serial_errors'])}"
             self.set_notice(msg + "."); return False
-        def fail(exc): self.set_notice(f"Apply failed: {exc}"); return False
+        def fail(exc):
+            self.set_notice(f"Apply failed: {exc}")
+            show_error_dialog(self, "Save HOME settings to MacroPad failed", exc)
+            return False
         ipc_async({"cmd": "push_to_device"}, ok, fail, timeout=20.0)
 
     def on_query_profiles(self, *_):
@@ -1469,6 +1612,12 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.background_file_chooser = None
 
     def on_background_apply(self, *_args):
+        if self.background_apply_pending:
+            self.set_notice("A background update is already in progress.")
+            return
+        if self.current_status.get("storage_quarantined"):
+            self.set_notice("MacroPad USB storage is quarantined. Reconnect the MacroPad before applying a background image.")
+            return
         if self.current_status.get("storage_guarded"):
             self.set_notice("Background update requires USB Mass Storage and is unavailable in Safe Mode.")
             return
@@ -1481,6 +1630,8 @@ class MainWindow(Gtk.ApplicationWindow):
             return
         theme = "dark" if int(self.background_theme.get_selected()) == 0 else "light"
         filename = BACKGROUND_FILENAMES[theme]
+        self.background_apply_pending = True
+        self.background_apply_button.set_sensitive(False)
         self.set_notice(f"Converting background to /tmp/eezopen/{filename}…")
 
         def worker():
@@ -1504,6 +1655,7 @@ class MainWindow(Gtk.ApplicationWindow):
         threading.Thread(target=worker, name="eezopen-background", daemon=True).start()
 
     def _background_apply_done(self, result):
+        self.background_apply_pending = False
         filename = result.get("filename", "background.bin")
         note = f"Background written to MacroPad app_icons/{filename}. Converted file kept at {result.get('source', '/tmp/eezopen')}. Rotate the MacroPad wheel to change layout so the new background is reloaded."
         if result.get("theme") == "light":
@@ -1513,7 +1665,10 @@ class MainWindow(Gtk.ApplicationWindow):
         return False
 
     def _background_apply_failed(self, exc):
+        self.background_apply_pending = False
         self.set_notice(f"Background update failed: {exc}")
+        show_error_dialog(self, "Background update failed", exc)
+        self.update_status()
         return False
 
     def on_background_remove(self, *_args):
@@ -1537,6 +1692,7 @@ class MainWindow(Gtk.ApplicationWindow):
 
         def fail(exc):
             self.set_notice(f"Background removal failed: {exc}")
+            show_error_dialog(self, "Background removal failed", exc)
             return False
 
         ipc_async({"cmd": "remove_background"}, ok, fail, timeout=20.0)
@@ -1756,14 +1912,14 @@ class MainWindow(Gtk.ApplicationWindow):
             self.screen_script_request_pending = True
             self.screen_script_run_button.set_sensitive(False)
             self.screen_script_run_button.set_label("Starting…")
-            self.set_notice("Starting Screen Script. Serial commands and key actions will remain active; PC Monitor display telemetry will pause.")
+            self.set_notice("Starting Screen Script. Host-side key actions remain active; daemon CDC transmission, PC Monitor telemetry, and USB Mass Storage changes pause until the Screen Script stops.")
 
             def ok(result):
                 self.screen_script_request_pending = False
                 self.update_status()
                 self.set_notice(
                     f"Screen Script running (PID {result.get('pid')}). "
-                    "EezOpen serial commands and key actions remain available."
+                    "Host-side key actions remain available; daemon CDC TX, PC Monitor, and USB Mass Storage changes are paused."
                 )
                 return False
 
@@ -1771,6 +1927,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.screen_script_request_pending = False
                 self.update_status()
                 self.set_notice(f"Failed to start Screen Script: {exc}")
+                show_error_dialog(self, "Failed to start Screen Script", exc)
                 return False
 
             ipc_async({
@@ -1796,6 +1953,7 @@ class MainWindow(Gtk.ApplicationWindow):
             self.screen_script_request_pending = False
             self.update_status()
             self.set_notice(f"Failed to stop Screen Script: {exc}")
+            show_error_dialog(self, "Failed to stop Screen Script", exc)
             return False
 
         ipc_async({"cmd": "stop_screen_script"}, ok, fail, timeout=8.0)
@@ -1804,7 +1962,9 @@ class MainWindow(Gtk.ApplicationWindow):
         popover.popdown()
         try:
             ipc_request({"cmd": "set_theme", "theme": theme}); self.set_notice(f"Theme {'dark' if theme == 'dark' else 'light'} sent. The MacroPad should reboot and reconnect.")
-        except Exception as exc: self.set_notice(f"Failed to change theme: {exc}")
+        except Exception as exc:
+            self.set_notice(f"Failed to change theme: {exc}")
+            show_error_dialog(self, "Failed to change MacroPad theme", exc)
 
     def on_rgb(self, *_): RgbWindow(self).present()
 
@@ -1828,7 +1988,10 @@ class MainWindow(Gtk.ApplicationWindow):
             response = ipc_request({"cmd": "get_key", "profile": self.current_profile, "key": key})
             cfg = response.get("config") or {}
             cfg["icon_path"] = response.get("icon_path")
-        except Exception as exc: self.set_notice(f"Failed to read key: {exc}"); return
+        except Exception as exc:
+            self.set_notice(f"Failed to read key: {exc}")
+            show_error_dialog(self, "Failed to open key configuration", exc)
+            return
         KeyEditor(self, self.current_profile, key, cfg).present()
 
 

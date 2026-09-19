@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""EezOpen daemon v1.3.1.
+"""EezOpen daemon v1.4.3.
 
 Owns the EezBotFun serial port, keeps a local cache, executes the small
 Non-HID action set used by EezOpen and exposes a local JSON/Unix-socket API
@@ -7,6 +7,7 @@ for the GTK configurator.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import glob
 import hashlib
 import hmac
@@ -27,7 +28,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 APP_NAME = "EezOpen"
-EEZOPEN_VERSION = "1.3.1"
+EEZOPEN_VERSION = "1.4.3"
 BAUD = termios.B460800
 POLL_INTERVAL = 2.0
 MAX_SERIAL_BUFFER = 64 * 1024
@@ -71,6 +72,10 @@ STATE_LOCK = threading.RLock()
 SERIAL_WRITE_LOCK = threading.Lock()
 SETTINGS_LOCK = threading.RLock()
 OPERATION_LOCK = threading.RLock()
+# Serial and Mass Storage are two interfaces of the same physical firmware.
+# This lock serializes *all* host->device I/O so CDC telemetry/commands can never
+# overlap an explicit MSC filesystem operation.
+DEVICE_IO_LOCK = threading.RLock()
 PROFILE_COND = threading.Condition(STATE_LOCK)
 SCREEN_SCRIPT_LOCK = threading.RLock()
 SCREEN_SCRIPT_PROCESS: Optional[subprocess.Popen] = None
@@ -84,6 +89,25 @@ PC_MONITOR_INTERVAL = 1.0
 # Experimental guard for the firmware's profile transition animation.
 # PCS telemetry is paused briefly so it cannot redraw the LCD mid-transition.
 PC_MONITOR_PROFILE_TRANSITION_DELAY = 0.80
+# The runtime CDC endpoint appears before Linux has necessarily finished the USB
+# Mass Storage/SCSI bring-up. Never probe or transmit to the firmware until the
+# composite device has remained stable and the MSC queue is idle.
+USB_RUNTIME_SETTLE_TIMEOUT = 15.0
+USB_MSC_SETTLE_SECONDS = 3.0
+USB_MSC_IDLE_STABLE_SECONDS = 1.0
+USB_SAFE_MODE_SETTLE_SECONDS = 5.0
+USB_NO_MSC_SETTLE_SECONDS = 2.0
+PC_MONITOR_STARTUP_DELAY = 2.0
+MSC_POST_UNMOUNT_DELAY = 0.50
+# Give the firmware a real direction-change gap before asking the MSC function
+# to mount. DEVICE_IO_LOCK prevents any new daemon CDC TX while this delay runs.
+MSC_PRE_ACCESS_CDC_QUIET = 0.75
+MSC_PRE_ACCESS_IDLE_TIMEOUT = 1.50
+MSC_PRE_ACCESS_IDLE_STABLE = 0.25
+# Foreground serial commands should fail quickly rather than queueing for seconds
+# behind a wedged SCSI request. The Configurator can retry after storage is idle.
+MSC_FOREGROUND_IDLE_TIMEOUT = 0.35
+MSC_FOREGROUND_IDLE_STABLE = 0.12
 # Host-side Mass Storage blocking is intentionally disabled. Safe Mode (PID 4005)
 # is handled separately because the firmware itself does not expose MSC there.
 HOST_MSC_STABILITY_GUARD = False
@@ -126,6 +150,20 @@ STATE: dict[str, Any] = {
     "storage_guarded": HOST_MSC_STABILITY_GUARD,
     "authenticated": False,
     "connection_generation": 0,
+    # Connection lifecycle. "connected" becomes True only after USB settle,
+    # serial probe and authentication have completed. Background telemetry also
+    # waits for pc_monitor_ready_at.
+    "operational": False,
+    "startup_phase": "waiting",
+    "startup_detail": None,
+    "pc_monitor_ready_at": 0.0,
+    "storage_busy": False,
+    # If a mount request times out, udisksctl exiting does not prove that the
+    # remote udisksd/kernel mount operation was cancelled. Quarantine all CDC TX
+    # until physical reconnect instead of racing an unresolved SCSI request.
+    "storage_quarantined": False,
+    "storage_quarantine_reason": None,
+    "last_cdc_tx_at": 0.0,
     # Firmware update reconnect guard. While active, the daemon must not probe,
     # authenticate, mount or otherwise touch a transient recovery/update USB
     # personality. It resumes only after the normal pre-update VID:PID has
@@ -276,6 +314,321 @@ def is_safe_mode_usb(vid: Any, pid: Any) -> bool:
     return str(vid or "").lower() == "303a" and str(pid or "").lower() == "4005"
 
 
+
+def _set_startup_phase(phase: str, detail: Optional[str] = None) -> None:
+    with STATE_LOCK:
+        STATE["startup_phase"] = phase
+        STATE["startup_detail"] = detail
+        if phase != "operational":
+            STATE["operational"] = False
+
+
+def _usb_identity_token(info: dict[str, Optional[str]]) -> tuple[str, str, str, str]:
+    sysfs = str(info.get("sysfs") or "")
+    devnum = _safe_read(Path(sysfs) / "devnum") if sysfs else ""
+    return (
+        sysfs,
+        str(info.get("vid") or "").lower(),
+        str(info.get("pid") or "").lower(),
+        devnum,
+    )
+
+
+def _usb_identity_unchanged(dev: str, token: tuple[str, str, str, str]) -> bool:
+    if not os.path.exists(dev):
+        return False
+    info = usb_device_info_from_tty(dev)
+    return _usb_identity_token(info) == token
+
+
+def _usb_has_mass_storage_interface(usb_sysfs: str) -> bool:
+    """Inspect USB interface class in sysfs without touching the block device."""
+    if not usb_sysfs:
+        return False
+    base = Path(usb_sysfs)
+    try:
+        for iface in base.glob(f"{base.name}:*"):
+            if _safe_read(iface / "bInterfaceClass").lower() == "08":
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _usb_block_devices_sysfs(usb_sysfs: str, *, include_partitions: bool = False) -> list[str]:
+    """Return block names belonging to this physical USB ancestor using sysfs only."""
+    if not usb_sysfs:
+        return []
+    try:
+        usb_root = Path(usb_sysfs).resolve()
+    except OSError:
+        return []
+    result: list[str] = []
+    block_root = Path("/sys/class/block")
+    try:
+        entries = list(block_root.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not include_partitions and (entry / "partition").exists():
+            continue
+        try:
+            target = entry.resolve()
+        except OSError:
+            continue
+        if target == usb_root or usb_root in target.parents:
+            result.append(entry.name)
+    return sorted(set(result))
+
+
+def _block_inflight_total(name: str) -> Optional[int]:
+    raw = _safe_read(Path("/sys/class/block") / name / "inflight")
+    if not raw:
+        return None
+    try:
+        return sum(int(part) for part in raw.split())
+    except ValueError:
+        return None
+
+
+def _usb_block_inflight_total(usb_sysfs: str) -> Optional[int]:
+    """Return current in-flight block I/O for this USB device using sysfs only.
+
+    ``None`` means the block device exists but Linux did not expose a readable
+    inflight counter.  Zero means no request is currently queued/in service.
+    This never opens the block device and therefore cannot itself trigger FAT I/O.
+    """
+    names = _usb_block_devices_sysfs(usb_sysfs)
+    if not names:
+        return 0
+    values = [_block_inflight_total(name) for name in names]
+    if any(value is None for value in values):
+        return None
+    return sum(int(value or 0) for value in values)
+
+
+def _wait_for_usb_block_idle(usb_sysfs: str, *, timeout: float = 1.5, stable: float = 0.15) -> bool:
+    """Wait for MSC block I/O to be continuously idle without touching the FAT."""
+    if not usb_sysfs:
+        return True
+    deadline = time.monotonic() + max(0.0, timeout)
+    idle_since: Optional[float] = None
+    while time.monotonic() < deadline:
+        inflight = _usb_block_inflight_total(usb_sysfs)
+        now = time.monotonic()
+        if inflight == 0:
+            if idle_since is None:
+                idle_since = now
+            if now - idle_since >= stable:
+                return True
+        else:
+            idle_since = None
+        time.sleep(0.025)
+    return False
+
+
+def _set_storage_quarantine(reason: str) -> None:
+    reason = str(reason or "MacroPad Mass Storage entered an unknown state")
+    with STATE_LOCK:
+        STATE["storage_quarantined"] = True
+        STATE["storage_quarantine_reason"] = reason
+        STATE["storage_error"] = reason
+        STATE["storage_ready"] = False
+        STATE["storage_root"] = None
+        STATE["source_dir"] = None
+        STATE["pc_monitor_last_error"] = reason
+    LOG.error("MacroPad MSC quarantined until USB reconnect: %s", reason)
+
+
+def _storage_quarantine_reason() -> Optional[str]:
+    with STATE_LOCK:
+        if not STATE.get("storage_quarantined"):
+            return None
+        return str(STATE.get("storage_quarantine_reason") or "MacroPad Mass Storage is quarantined")
+
+
+def _wait_cdc_quiet_before_msc() -> None:
+    """Hold the device gate until the last daemon CDC TX is safely behind us."""
+    with STATE_LOCK:
+        last_tx = float(STATE.get("last_cdc_tx_at") or 0.0)
+    if last_tx <= 0:
+        return
+    remaining = MSC_PRE_ACCESS_CDC_QUIET - (time.monotonic() - last_tx)
+    if remaining > 0:
+        LOG.debug("MSC pre-access quiet period: waiting %.0f ms after last CDC TX", remaining * 1000.0)
+        time.sleep(remaining)
+
+
+def _usb_block_mounts(usb_sysfs: str) -> list[tuple[str, str]]:
+    """Return (/dev/node, mountpoint) for this USB device without reading its FS."""
+    names = set(_usb_block_devices_sysfs(usb_sysfs, include_partitions=True))
+    if not names:
+        return []
+    mounts: list[tuple[str, str]] = []
+    try:
+        lines = Path("/proc/self/mounts").read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        source, mountpoint = parts[0], parts[1]
+        if source.startswith("/dev/") and Path(source).name in names:
+            mounts.append((source, mountpoint.replace("\\040", " ")))
+    return mounts
+
+
+def _runtime_storage_mounted() -> bool:
+    with STATE_LOCK:
+        sysfs = str(STATE.get("usb_sysfs") or "")
+    return bool(_usb_block_mounts(sysfs)) if sysfs else False
+
+
+def _unmount_usb_mounts_sysfs(usb_sysfs: str, *, only_automounts: bool = False) -> bool:
+    """Unmount known mounts for this MacroPad without discovering files on the FAT volume."""
+    mounts = _usb_block_mounts(usb_sysfs)
+    if only_automounts:
+        user = os.environ.get("USER") or ""
+        prefixes = tuple(x for x in (f"/media/{user}/", f"/run/media/{user}/") if user)
+        mounts = [(dev, mp) for dev, mp in mounts if prefixes and mp.startswith(prefixes)]
+    ok = True
+    seen: set[str] = set()
+    for dev, mountpoint in mounts:
+        if dev in seen:
+            continue
+        seen.add(dev)
+        try:
+            if shutil.which("udisksctl"):
+                cmd = ["udisksctl", "unmount", "-b", dev]
+            else:
+                cmd = ["umount", mountpoint]
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  text=True, timeout=12, check=False)
+            if proc.returncode != 0:
+                LOG.warning("Could not unmount MacroPad storage %s (%s): %s",
+                            dev, mountpoint, proc.stdout.strip())
+                ok = False
+            else:
+                LOG.info("MacroPad storage unmounted: %s (%s)", dev, mountpoint)
+        except Exception as exc:
+            LOG.warning("Could not unmount MacroPad storage %s: %s", dev, exc)
+            ok = False
+    return ok
+
+
+def wait_for_runtime_ready(dev: str) -> bool:
+    """Wait for one USB enumeration to be safe before opening the CDC tty.
+
+    This function intentionally uses only sysfs/procfs. It never opens the tty,
+    mounts the volume, runs blkid, or reads the FAT filesystem. On MSC-enabled
+    runtime it waits until the block device exists, the initial SCSI activity has
+    settled, and the queue has remained idle for a continuous interval.
+    """
+    info = usb_device_info_from_tty(dev)
+    token = _usb_identity_token(info)
+    usb_sysfs = str(info.get("sysfs") or "")
+    pid = str(info.get("pid") or "").lower()
+    if not usb_sysfs:
+        return False
+
+    if pid == "4005":
+        _set_startup_phase("settling-safe-mode", "waiting to distinguish transient 4005 from stable Safe Mode")
+        LOG.info("MacroPad PID 4005 detected; leaving CDC untouched for %.1fs",
+                 USB_SAFE_MODE_SETTLE_SECONDS)
+        deadline = time.monotonic() + USB_SAFE_MODE_SETTLE_SECONDS
+        while RUNNING and time.monotonic() < deadline:
+            if not _usb_identity_unchanged(dev, token):
+                LOG.info("MacroPad USB identity changed while PID 4005 was settling; redetecting")
+                return False
+            time.sleep(0.10)
+        if not RUNNING or not _usb_identity_unchanged(dev, token):
+            return False
+        _set_startup_phase("usb-ready", "stable Safe Mode; CDC probe allowed")
+        LOG.info("MacroPad Safe Mode remained stable; CDC probe allowed")
+        return True
+
+    has_msc = _usb_has_mass_storage_interface(usb_sysfs)
+    if not has_msc:
+        _set_startup_phase("settling", "runtime has no MSC interface; waiting for USB identity stability")
+        deadline = time.monotonic() + USB_NO_MSC_SETTLE_SECONDS
+        while RUNNING and time.monotonic() < deadline:
+            if not _usb_identity_unchanged(dev, token):
+                return False
+            time.sleep(0.10)
+        if not RUNNING or not _usb_identity_unchanged(dev, token):
+            return False
+        _set_startup_phase("usb-ready", "USB identity stable; CDC probe allowed")
+        return True
+
+    _set_startup_phase("settling-msc", "waiting for Mass Storage/SCSI initialization to become idle")
+    LOG.info("MacroPad MSC runtime detected; CDC will remain untouched until block I/O settles")
+    deadline = time.monotonic() + USB_RUNTIME_SETTLE_TIMEOUT
+    block_seen_at: Optional[float] = None
+    idle_since: Optional[float] = None
+    last_inflight: Optional[int] = None
+
+    while RUNNING and time.monotonic() < deadline:
+        if not _usb_identity_unchanged(dev, token):
+            LOG.info("MacroPad USB identity changed during MSC settle; redetecting")
+            return False
+        blocks = _usb_block_devices_sysfs(usb_sysfs)
+        now = time.monotonic()
+        if not blocks:
+            block_seen_at = None
+            idle_since = None
+            time.sleep(0.10)
+            continue
+        if block_seen_at is None:
+            block_seen_at = now
+            LOG.info("MacroPad block device appeared: %s; holding CDC for %.1fs minimum settle",
+                     ", ".join("/dev/" + x for x in blocks), USB_MSC_SETTLE_SECONDS)
+
+        totals = [_block_inflight_total(name) for name in blocks]
+        known = all(value is not None for value in totals)
+        inflight = sum(int(value or 0) for value in totals)
+        if inflight != last_inflight:
+            LOG.debug("MacroPad MSC inflight=%s blocks=%s", inflight if known else "unknown", blocks)
+            last_inflight = inflight
+
+        minimum_elapsed = (now - block_seen_at) >= USB_MSC_SETTLE_SECONDS
+        if minimum_elapsed and known and inflight == 0:
+            if idle_since is None:
+                idle_since = now
+            if now - idle_since >= USB_MSC_IDLE_STABLE_SECONDS:
+                # Desktop automounters may have mounted the tiny FAT volume while
+                # it was settling. Release only normal user-session automounts now,
+                # before any CDC traffic starts. Explicit/manual mounts elsewhere
+                # are left alone and background telemetry will stay suppressed.
+                _unmount_usb_mounts_sysfs(usb_sysfs, only_automounts=True)
+                time.sleep(MSC_POST_UNMOUNT_DELAY)
+                if not _usb_identity_unchanged(dev, token):
+                    return False
+                remaining_mounts = _usb_block_mounts(usb_sysfs)
+                if remaining_mounts:
+                    _set_startup_phase("waiting-mounted", "MacroPad Mass Storage is mounted; CDC will stay untouched")
+                    LOG.warning("MacroPad storage is still mounted (%s); refusing CDC probe until it is unmounted",
+                                ", ".join(mp for _dev, mp in remaining_mounts))
+                    return False
+                blocks2 = _usb_block_devices_sysfs(usb_sysfs)
+                inflight2 = sum(int(_block_inflight_total(name) or 0) for name in blocks2)
+                if inflight2 != 0:
+                    idle_since = None
+                    continue
+                _set_startup_phase("usb-ready", "MSC initialized and idle; CDC probe allowed")
+                LOG.info("MacroPad USB runtime stable: MSC idle for %.1fs; CDC probe allowed",
+                         USB_MSC_IDLE_STABLE_SECONDS)
+                return True
+        else:
+            idle_since = None
+        time.sleep(0.10)
+
+    LOG.warning("MacroPad USB runtime did not reach a safe idle state within %.1fs; CDC was not opened",
+                USB_RUNTIME_SETTLE_TIMEOUT)
+    _set_startup_phase("waiting", "MSC did not become safely idle; will retry without touching CDC")
+    return False
+
+
 def serial_candidates() -> list[str]:
     found: list[str] = []
     for pattern in (
@@ -354,7 +707,7 @@ def probe_device(fd: int) -> tuple[Optional[str], Optional[str], Optional[int], 
     """Query confirmed type (e), device ID (f), and profile count (l -> n=N)."""
     termios.tcflush(fd, termios.TCIFLUSH)
     for payload in ("e", "f", "l"):
-        os.write(fd, frame(payload))
+        _write_fd_nonblocking(fd, frame(payload), timeout=1.0)
         time.sleep(0.04)
     lines = read_lines_for(fd, 1.3)
     dtype = did = None
@@ -420,7 +773,7 @@ def authenticate_device(fd: int, device_id: str) -> tuple[bool, list[str]]:
     try:
         _write_fd_nonblocking(fd, frame("g" + stamp), timeout=1.5)
         lines = read_lines_for(fd, 1.2)
-    except (OSError, termios.error) as exc:
+    except (OSError, termios.error, TimeoutError) as exc:
         LOG.warning("Authentication: failed to send challenge: %s", exc)
         return False, []
     for msg in lines:
@@ -433,39 +786,52 @@ def authenticate_device(fd: int, device_id: str) -> tuple[bool, list[str]]:
     return False, lines
 
 
+
 def detect_device(required_usb: Optional[tuple[str, str]] = None):
     for dev in serial_candidates():
         fd = None
         try:
-            # During a firmware update, never even open a transient recovery
-            # personality.  The working shell updater leaves that phase alone.
-            if required_usb is not None:
-                usb_pre = usb_device_info_from_tty(dev)
-                if (usb_pre.get("vid"), usb_pre.get("pid")) != required_usb:
-                    continue
-            fd = open_serial(dev)
-            dtype, did, profile_count, replies = probe_device(fd)
-            if dtype is None:
-                os.close(fd)
+            usb_pre = usb_device_info_from_tty(dev)
+            # During firmware update, never open a transient recovery personality.
+            if required_usb is not None and (usb_pre.get("vid"), usb_pre.get("pid")) != required_usb:
                 continue
-            if not did:
-                usb_serial = usb_serial_from_tty(dev)
-                did = f"type{dtype}-{usb_serial}" if usb_serial else f"type{dtype}-{Path(dev).name}"
-            authenticated, auth_replies = authenticate_device(fd, did)
-            usb = usb_device_info_from_tty(dev)
-            LOG.info(
-                "MacroPad detected: dev=%s type=%s id=%s profiles=%s usb=%s:%s auth=%s",
-                dev, dtype, did, profile_count, usb.get("vid") or "?", usb.get("pid") or "?",
-                "ok" if authenticated else "not-confirmed",
-            )
-            LOG.debug("Probe replies: %r auth replies: %r", replies, auth_replies)
-            return {
-                "fd": fd, "dev": dev, "type": dtype, "id": did, "profile_count": profile_count,
-                "usb_sysfs": usb.get("sysfs"), "usb_vid": usb.get("vid"),
-                "usb_pid": usb.get("pid"), "usb_serial": usb.get("serial"),
-                "authenticated": authenticated,
-            }
-        except (OSError, termios.error) as exc:
+            # Critical startup barrier: ttyACM may exist while usb-storage/SCSI is
+            # still initializing. Do not even open/configure the tty until that
+            # physical USB enumeration is demonstrably stable.
+            if not wait_for_runtime_ready(dev):
+                continue
+            _set_startup_phase("probing", "USB stable; probing CDC identity")
+            with DEVICE_IO_LOCK:
+                # Re-check after taking the device-wide lock.
+                usb_now = usb_device_info_from_tty(dev)
+                if required_usb is not None and (usb_now.get("vid"), usb_now.get("pid")) != required_usb:
+                    continue
+                if not is_eezbotfun_runtime_tty(dev):
+                    continue
+                fd = open_serial(dev)
+                dtype, did, profile_count, replies = probe_device(fd)
+                if dtype is None:
+                    os.close(fd)
+                    fd = None
+                    continue
+                if not did:
+                    usb_serial = usb_serial_from_tty(dev)
+                    did = f"type{dtype}-{usb_serial}" if usb_serial else f"type{dtype}-{Path(dev).name}"
+                authenticated, auth_replies = authenticate_device(fd, did)
+                usb = usb_device_info_from_tty(dev)
+                LOG.info(
+                    "MacroPad detected: dev=%s type=%s id=%s profiles=%s usb=%s:%s auth=%s",
+                    dev, dtype, did, profile_count, usb.get("vid") or "?", usb.get("pid") or "?",
+                    "ok" if authenticated else "not-confirmed",
+                )
+                LOG.debug("Probe replies: %r auth replies: %r", replies, auth_replies)
+                return {
+                    "fd": fd, "dev": dev, "type": dtype, "id": did, "profile_count": profile_count,
+                    "usb_sysfs": usb.get("sysfs"), "usb_vid": usb.get("vid"),
+                    "usb_pid": usb.get("pid"), "usb_serial": usb.get("serial"),
+                    "authenticated": authenticated,
+                }
+        except (OSError, termios.error, TimeoutError) as exc:
             if fd is not None:
                 try:
                     os.close(fd)
@@ -473,6 +839,7 @@ def detect_device(required_usb: Optional[tuple[str, str]] = None):
                     pass
             LOG.debug("Failed to probe %s: %s", dev, exc)
     return None
+
 
 
 def firmware_detection_target() -> Optional[tuple[str, str] | bool]:
@@ -808,6 +1175,18 @@ def ensure_device_storage(try_mount: bool = True) -> Path:
                 LOG.info("udisksctl mount %s: rc=%s %s", dev, proc.returncode, proc.stdout.strip())
                 if proc.returncode != 0:
                     errors.append(proc.stdout.strip())
+            except subprocess.TimeoutExpired as exc:
+                # udisksctl is only the D-Bus client. Killing/timing out the
+                # client does NOT guarantee that udisksd or the kernel mount
+                # request stopped. Continuing with CDC here can recreate the
+                # exact MSC/CDC race we are trying to avoid.
+                reason = (
+                    f"udisksctl mount {dev} timed out after {exc.timeout:g}s; "
+                    "the underlying Mass Storage request may still be active. "
+                    "CDC transmission is quarantined until the MacroPad is reconnected"
+                )
+                _set_storage_quarantine(reason)
+                raise _storage_failure(reason) from exc
             except Exception as exc:
                 errors.append(str(exc))
         time.sleep(0.25)
@@ -835,6 +1214,136 @@ def ensure_device_storage(try_mount: bool = True) -> Path:
     if blocks:
         raise _storage_failure("EezBotFun storage detected but is not mounted yet")
     raise _storage_failure("MacroPad USB storage was not found on the bus")
+
+
+
+def _mounted_block_for_root(root: Path) -> Optional[str]:
+    root = Path(root)
+    for item in _lsblk_records():
+        if root in _mountpoints(item):
+            name = str(item.get("name") or "").strip()
+            if name:
+                return name
+    return None
+
+
+def unmount_device_storage(root: Path) -> None:
+    """Release the MacroPad FAT mount without power-cycling the composite USB device."""
+    root = Path(root)
+    device = _mounted_block_for_root(root)
+    if device is None:
+        LOG.info("MacroPad storage already unmounted: %s", root)
+    else:
+        if shutil.which("udisksctl"):
+            cmd = ["udisksctl", "unmount", "-b", device]
+        elif shutil.which("umount"):
+            cmd = ["umount", str(root)]
+        else:
+            raise RuntimeError("Cannot unmount MacroPad storage: udisksctl/umount not found")
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True, timeout=12, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(f"Failed to unmount MacroPad storage {device}: {proc.stdout.strip()}")
+        LOG.info("MacroPad storage unmounted: device=%s root=%s", device, root)
+    with STATE_LOCK:
+        if STATE.get("storage_root") == str(root):
+            STATE["storage_root"] = None
+        source = STATE.get("source_dir")
+        if source and str(source).startswith(str(root) + os.sep):
+            STATE["source_dir"] = None
+        STATE["storage_ready"] = False
+        STATE["storage_error"] = None
+
+
+@contextmanager
+def device_storage_session(*, write: bool = False):
+    """Exclusive MSC session coordinated with every daemon CDC transmitter.
+
+    The lock is acquired before the CDC->MSC quiet period and remains held until
+    the filesystem is unmounted and block I/O has drained. If a mount times out,
+    MSC is quarantined until physical reconnect because a timed-out udisksctl
+    client cannot prove that the udisksd/kernel request was cancelled.
+    """
+    with DEVICE_IO_LOCK:
+        with STATE_LOCK:
+            if not STATE.get("connected") or not STATE.get("operational"):
+                raise RuntimeError("MacroPad is not operational yet")
+            if STATE.get("screen_script_active"):
+                raise RuntimeError("Stop the Screen Script before accessing MacroPad USB Mass Storage")
+            if STATE.get("storage_quarantined"):
+                reason = str(STATE.get("storage_quarantine_reason") or "Mass Storage is quarantined")
+                raise RuntimeError(f"{reason}. Reconnect the MacroPad before another storage operation")
+            STATE["storage_busy"] = True
+            STATE["pc_monitor_pause_until"] = max(
+                float(STATE.get("pc_monitor_pause_until") or 0.0),
+                time.monotonic() + 3600.0,
+            )
+            usb_sysfs = str(STATE.get("usb_sysfs") or "")
+
+        mounted_before = {str(path) for path in _mounted_eez_roots()}
+        root: Optional[Path] = None
+        body_error: Optional[BaseException] = None
+        attempted_storage = False
+        try:
+            # A lock prevents NEW daemon CDC frames, but the firmware may still
+            # be finishing the frame sent just before we acquired it. Give the
+            # composite device a real direction-change gap before mounting FAT.
+            _wait_cdc_quiet_before_msc()
+            if usb_sysfs and not _wait_for_usb_block_idle(
+                    usb_sysfs,
+                    timeout=MSC_PRE_ACCESS_IDLE_TIMEOUT,
+                    stable=MSC_PRE_ACCESS_IDLE_STABLE):
+                raise RuntimeError(
+                    "MacroPad USB Mass Storage I/O is already active; "
+                    "storage operation was not started"
+                )
+
+            attempted_storage = True
+            root = ensure_device_storage(try_mount=True)
+            yield root
+        except BaseException as exc:
+            body_error = exc
+            raise
+        finally:
+            cleanup_error: Optional[Exception] = None
+            if root is not None:
+                if write:
+                    try:
+                        flush_storage(root)
+                    except Exception as exc:
+                        cleanup_error = exc
+                        LOG.error("MacroPad storage flush failed: %s", exc)
+                # Even when flush reports an error, still attempt to release the
+                # filesystem so a failed write cannot leave FAT mounted forever.
+                if write or str(root) not in mounted_before:
+                    try:
+                        unmount_device_storage(root)
+                    except Exception as exc:
+                        if cleanup_error is None:
+                            cleanup_error = exc
+                        LOG.error("MacroPad storage unmount failed: %s", exc)
+
+            # Drain the queue even when mounting failed before we obtained a
+            # root. This was missing in v1.4.1 and allowed CDC to resume while a
+            # timed-out udisksd request was still issuing SCSI commands.
+            if attempted_storage and usb_sysfs:
+                quarantined = _storage_quarantine_reason() is not None
+                idle_timeout = 0.50 if quarantined else 2.50
+                if not _wait_for_usb_block_idle(usb_sysfs, timeout=idle_timeout, stable=0.20):
+                    if not quarantined:
+                        LOG.warning("MacroPad block queue did not become idle promptly after storage cleanup")
+
+            with STATE_LOCK:
+                STATE["storage_busy"] = False
+                STATE["pc_monitor_pause_until"] = time.monotonic() + MSC_POST_UNMOUNT_DELAY
+                quarantined = bool(STATE.get("storage_quarantined"))
+
+            # After a normal session, give the firmware a quiet post-MSC gap.
+            # Quarantined sessions deliberately do not resume CDC at all.
+            if attempted_storage and not quarantined:
+                time.sleep(MSC_POST_UNMOUNT_DELAY)
+            if cleanup_error is not None and body_error is None:
+                raise cleanup_error
 
 
 def replace_tree_from_source(source: Path, target: Path) -> None:
@@ -925,41 +1434,35 @@ def _sync_device_view_from_root(root: Path, device_id: str) -> dict[str, Any]:
     }
 
 
+
 def sync_from_device(device_id: str) -> dict[str, Any]:
     """Refresh the ephemeral device view without modifying the persistent cache."""
     with OPERATION_LOCK:
-        root = ensure_device_storage(try_mount=True)
-        return _sync_device_view_from_root(root, device_id)
+        with device_storage_session(write=False) as root:
+            return _sync_device_view_from_root(root, device_id)
+
+
 
 
 def import_from_device(device_id: str) -> dict[str, Any]:
-    """Explicitly replace the persistent EezOpen cache with the MacroPad contents.
-
-    Automatic discovery intentionally mirrors the device only into XDG_RUNTIME_DIR.
-    This operation is the user-approved promotion step that makes the connected
-    MacroPad the source of truth for configs, scripts, and app_icons in
-    ~/.local/share/EezOpen.
-    """
+    """Explicitly replace the persistent EezOpen cache with the MacroPad contents."""
     with STATE_LOCK:
-        connected = bool(STATE.get("connected"))
+        connected = bool(STATE.get("connected") and STATE.get("operational"))
         selected_id = str(STATE.get("id") or "")
     if not connected:
-        raise RuntimeError("MacroPad is not connected")
+        raise RuntimeError("MacroPad is not operational yet")
     if not selected_id or selected_id != str(device_id):
         raise RuntimeError("The selected MacroPad changed before the import started")
 
     with OPERATION_LOCK:
-        root = ensure_device_storage(try_mount=True)
-        config_target = local_config_dir(device_id)
-        icon_target = local_icon_dir(device_id)
-        script_target = local_script_dir(device_id)
-
-        configs_synced = _replace_tree_or_empty(root / "configs", config_target)
-        icons_synced = _replace_tree_or_empty(root / "app_icons", icon_target)
-        scripts_synced = _replace_tree_or_empty(root / "scripts", script_target)
-
-        # Keep the live view aligned with exactly what was imported.
-        view_result = _sync_device_view_from_root(root, device_id)
+        with device_storage_session(write=False) as root:
+            config_target = local_config_dir(device_id)
+            icon_target = local_icon_dir(device_id)
+            script_target = local_script_dir(device_id)
+            configs_synced = _replace_tree_or_empty(root / "configs", config_target)
+            icons_synced = _replace_tree_or_empty(root / "app_icons", icon_target)
+            scripts_synced = _replace_tree_or_empty(root / "scripts", script_target)
+            view_result = _sync_device_view_from_root(root, device_id)
 
         with STATE_LOCK:
             STATE["config_dir"] = str(config_target)
@@ -969,25 +1472,18 @@ def import_from_device(device_id: str) -> dict[str, Any]:
         configs = len(list(config_target.glob("profile_*_key_*.txt")))
         scripts = len(list(script_target.glob("profile_*_key_*.txt")))
         icons = len(list(icon_target.glob("*"))) if icon_target.is_dir() else 0
-        LOG.info(
-            "Imported MacroPad into persistent cache: id=%s configs=%s scripts=%s icons=%s",
-            device_id, configs, scripts, icons,
-        )
+        LOG.info("Imported MacroPad into persistent cache: id=%s configs=%s scripts=%s icons=%s",
+                 device_id, configs, scripts, icons)
         return {
-            "ok": True,
-            "device_id": device_id,
-            "config_dir": str(config_target),
-            "script_dir": str(script_target),
-            "icon_dir": str(icon_target),
-            "configs": configs,
-            "scripts": scripts,
-            "icons": icons,
-            "configs_synced": configs_synced,
-            "scripts_synced": scripts_synced,
-            "icons_synced": icons_synced,
+            "ok": True, "device_id": device_id,
+            "config_dir": str(config_target), "script_dir": str(script_target),
+            "icon_dir": str(icon_target), "configs": configs, "scripts": scripts,
+            "icons": icons, "configs_synced": configs_synced,
+            "scripts_synced": scripts_synced, "icons_synced": icons_synced,
             "persistent_cache_modified": True,
             "view_config_dir": view_result.get("view_config_dir"),
         }
+
 
 
 def _refresh_view_key_from_cache(device_id: str, profile: int, key: int) -> None:
@@ -1031,6 +1527,11 @@ def parse_config_file(filename: Path) -> Optional[dict[str, Any]]:
             cfg["alias"] = line[6:]
         elif line.startswith("HidMode="):
             cfg["hid"] = line[8:].lower() == "true"
+        elif line.startswith("EezOpenExternalScript="):
+            # EezOpen-only metadata. This line is kept in the HOME cache but
+            # is deliberately stripped before a config is written to the
+            # MacroPad, so the device only sees its known ACT syntax.
+            cfg["eezopen_external_script"] = line.split("=", 1)[1].strip().lower() == "true"
         elif line.startswith("ACT "):
             parts = line.split(" ", 2)
             if len(parts) >= 2:
@@ -1061,6 +1562,27 @@ def atomic_write(path: Path, text: str) -> None:
         fp.flush()
         os.fsync(fp.fileno())
     os.replace(tmp, path)
+
+
+def device_compatible_config_text(text: str) -> str:
+    """Return the config representation safe to persist on the MacroPad.
+
+    External Script is an EezOpen GUI/runtime feature, but the physical device
+    should only receive action IDs already observed in the official format.
+    New EezOpen configs therefore keep ACT 2 on-device and store the
+    External-Script distinction only as HOME metadata. Legacy ACT p cache
+    entries are translated to ACT 2 when copied to the device.
+    """
+    output: list[str] = []
+    for line in str(text).splitlines():
+        if line.startswith("EezOpenExternalScript="):
+            continue
+        if line == "ACT p":
+            line = "ACT 2"
+        elif line.startswith("ACT p "):
+            line = "ACT 2 " + line[6:]
+        output.append(line)
+    return "\n".join(output) + ("\n" if str(text).endswith("\n") else "")
 
 
 def copy_file_fsync(source: Path, destination: Path) -> None:
@@ -1309,6 +1831,15 @@ def run_action(cfg: dict[str, Any], profile: Optional[int] = None, key: Optional
     if act == "1" and arg:
         spawn(["xdg-open", arg if "://" in arg else "https://" + arg])
     elif act == "2":
+        if cfg.get("eezopen_external_script") is True:
+            if profile is None or key is None:
+                LOG.error("External Script execution ignored without profile/key context")
+                return
+            try:
+                launch_external_script(arg, str(cfg.get("alias", "")), int(profile), int(key))
+            except Exception as exc:
+                LOG.error("EXTERNAL SCRIPT failed to start profile=%s key=%s: %s", profile, key, exc)
+            return
         argv = shlex.split(arg)
         if not argv:
             return
@@ -1351,36 +1882,66 @@ def invalidate_serial(fd: Optional[int], reason: str) -> None:
     LOG.info("Serial connection invalidated: %s", reason)
 
 
-def serial_payload(payload: str) -> None:
-    with STATE_LOCK:
-        fd = STATE.get("fd") if STATE.get("connected") else None
-        generation = int(STATE.get("connection_generation") or 0)
-    if fd is None:
-        raise RuntimeError("MacroPad is not connected")
 
-    # Snapshot the mutex.  Reconnect replaces the global mutex, so an old
-    # blocked writer cannot stall commands belonging to the new tty session.
-    write_lock = SERIAL_WRITE_LOCK
-    if not write_lock.acquire(timeout=2.0):
-        invalidate_serial(fd, "fila de escrita serial travada")
-        raise RuntimeError("Serial write queue stalled; connection invalidated for redetection")
-    try:
+def serial_payload(payload: str, *, allow_screen_script: bool = False) -> None:
+    """Send one EBF command while holding the physical-device I/O gate."""
+    with DEVICE_IO_LOCK:
         with STATE_LOCK:
-            if (not STATE.get("connected") or STATE.get("fd") != fd or
-                    int(STATE.get("connection_generation") or 0) != generation):
-                raise RuntimeError("Serial connection changed during the command; try again")
-        _write_fd_nonblocking(fd, frame(payload), timeout=1.5)
-    except (OSError, TimeoutError) as exc:
-        # A reboot/re-enumeration commonly turns ttyACM0 into ttyACM1.
-        # Do not keep a stale fd marked as connected after EIO/ENODEV/EBADF.
-        invalidate_serial(fd, f"write {payload!r} failed: {exc}")
-        raise RuntimeError("Serial connection dropped; waiting for MacroPad redetection") from exc
-    finally:
+            fd = STATE.get("fd") if STATE.get("connected") else None
+            generation = int(STATE.get("connection_generation") or 0)
+            operational = bool(STATE.get("operational"))
+            screen_active = bool(STATE.get("screen_script_active"))
+            storage_busy = bool(STATE.get("storage_busy"))
+            storage_quarantined = bool(STATE.get("storage_quarantined"))
+            quarantine_reason = str(STATE.get("storage_quarantine_reason") or "")
+            usb_sysfs = str(STATE.get("usb_sysfs") or "")
+        if fd is None or not operational:
+            raise RuntimeError("MacroPad is not operational yet")
+        if storage_quarantined:
+            raise RuntimeError(
+                (quarantine_reason or "MacroPad USB Mass Storage is quarantined") +
+                "; CDC writes are disabled until the MacroPad is reconnected"
+            )
+        if storage_busy:
+            raise RuntimeError("MacroPad USB Mass Storage operation is in progress")
+        # A mounted-but-idle FAT volume is not itself an occupied CDC channel.
+        # Blocking every foreground command merely because the desktop mounted
+        # the volume made the Configurator unusable.  What matters for firmware
+        # safety is active MSC I/O.  Since DEVICE_IO_LOCK is already held, no
+        # EezOpen storage transaction can start while we perform this check.
+        if usb_sysfs and not _wait_for_usb_block_idle(
+                usb_sysfs,
+                timeout=MSC_FOREGROUND_IDLE_TIMEOUT,
+                stable=MSC_FOREGROUND_IDLE_STABLE):
+            raise RuntimeError("MacroPad USB Mass Storage I/O is active; serial command was not sent")
+        if screen_active and not allow_screen_script:
+            raise RuntimeError("Screen Script is active; daemon CDC writes are paused to keep one serial writer")
+
+        write_lock = SERIAL_WRITE_LOCK
+        if not write_lock.acquire(timeout=2.0):
+            invalidate_serial(fd, "fila de escrita serial travada")
+            raise RuntimeError("Serial write queue stalled; connection invalidated for redetection")
         try:
-            write_lock.release()
-        except RuntimeError:
-            pass
-    LOG.debug("TX payload=%r generation=%s", payload, generation)
+            with STATE_LOCK:
+                if (not STATE.get("connected") or not STATE.get("operational") or
+                        STATE.get("fd") != fd or
+                        int(STATE.get("connection_generation") or 0) != generation):
+                    raise RuntimeError("Serial connection changed during the command; try again")
+                if STATE.get("screen_script_active") and not allow_screen_script:
+                    raise RuntimeError("Screen Script became active; serial command cancelled")
+            _write_fd_nonblocking(fd, frame(payload), timeout=1.5)
+            with STATE_LOCK:
+                STATE["last_cdc_tx_at"] = time.monotonic()
+        except (OSError, TimeoutError) as exc:
+            invalidate_serial(fd, f"write {payload!r} failed: {exc}")
+            raise RuntimeError("Serial connection dropped; waiting for MacroPad redetection") from exc
+        finally:
+            try:
+                write_lock.release()
+            except RuntimeError:
+                pass
+        LOG.debug("TX payload=%r generation=%s", payload, generation)
+
 
 
 def pc_read_number(path: Path, divisor: float = 1.0) -> Optional[float]:
@@ -1949,69 +2510,78 @@ def pause_pc_monitor_for_profile_transition(profile: int) -> None:
     )
 
 
+
 def serial_pcs_status(status: dict[str, Any]) -> bool:
-    """Best-effort PCS write through the daemon-owned serial descriptor.
-
-    Confirmed framing:
-        b"pcs" + uint16_be(JSON_length) + compact UTF-8 JSON
-
-    The official Configurator emitted this as three writes, so keep that exact
-    shape while holding the daemon's serial mutex for the whole frame.
-    """
+    """Best-effort PC Monitor write; never competes with MSC or foreground CDC."""
     body = json.dumps(status, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(body) > 0xFFFF:
         raise ValueError("PC monitor JSON is too large")
 
-    with STATE_LOCK:
-        fd = STATE.get("fd") if STATE.get("connected") else None
-        generation = int(STATE.get("connection_generation") or 0)
-    if fd is None:
+    # Telemetry is disposable. If the physical device is doing anything else,
+    # skip this sample instead of queueing behind it.
+    if not DEVICE_IO_LOCK.acquire(timeout=0.05):
         return False
-
-    # Background telemetry must never break interactive/configuration writes.
-    # If the serial queue is busy, simply skip this one sample.
-    write_lock = SERIAL_WRITE_LOCK
-    if not write_lock.acquire(timeout=0.20):
-        return False
-
     try:
         with STATE_LOCK:
-            if (not STATE.get("connected") or STATE.get("fd") != fd or
-                    int(STATE.get("connection_generation") or 0) != generation):
+            fd = STATE.get("fd") if STATE.get("connected") else None
+            generation = int(STATE.get("connection_generation") or 0)
+            if (fd is None or not STATE.get("operational") or STATE.get("storage_busy") or
+                    STATE.get("storage_quarantined") or STATE.get("screen_script_active") or
+                    time.monotonic() < float(STATE.get("pc_monitor_ready_at") or 0.0) or
+                    time.monotonic() < float(STATE.get("pc_monitor_pause_until") or 0.0)):
                 return False
-            if STATE.get("screen_script_active"):
+            usb_sysfs = str(STATE.get("usb_sysfs") or "")
+        # PC Monitor is disposable background traffic.  Keep it more conservative
+        # than foreground Configurator commands: pause while the FAT is mounted
+        # *or* while any raw block request (for example fsck/udisks/GVfs) is active.
+        # This also makes an offline fsck safe while the daemon stays running.
+        if usb_sysfs:
+            if _usb_block_mounts(usb_sysfs):
                 return False
-            # Re-check the transition guard only after owning the serial mutex.
-            # This closes the race where a telemetry sample was prepared just
-            # before activate_profile() started the firmware animation.
-            if time.monotonic() < float(STATE.get("pc_monitor_pause_until") or 0.0):
+            inflight = _usb_block_inflight_total(usb_sysfs)
+            if inflight is None or inflight > 0:
                 return False
 
-        _write_fd_nonblocking(fd, b"pcs", timeout=0.75)
-        _write_fd_nonblocking(fd, len(body).to_bytes(2, "big"), timeout=0.75)
-        _write_fd_nonblocking(fd, body, timeout=0.75)
-    except TimeoutError as exc:
-        # PC-monitor telemetry is best-effort. A congested serial write must not
-        # tear down an otherwise healthy MacroPad session; skip this sample and
-        # let the normal serial reader detect a real disconnect independently.
+        write_lock = SERIAL_WRITE_LOCK
+        if not write_lock.acquire(timeout=0.20):
+            return False
+        try:
+            with STATE_LOCK:
+                if (not STATE.get("connected") or not STATE.get("operational") or
+                        STATE.get("fd") != fd or STATE.get("storage_busy") or
+                        STATE.get("storage_quarantined") or STATE.get("screen_script_active") or
+                        int(STATE.get("connection_generation") or 0) != generation):
+                    return False
+            _write_fd_nonblocking(fd, b"pcs", timeout=0.75)
+            _write_fd_nonblocking(fd, len(body).to_bytes(2, "big"), timeout=0.75)
+            _write_fd_nonblocking(fd, body, timeout=0.75)
+            with STATE_LOCK:
+                STATE["last_cdc_tx_at"] = time.monotonic()
+        except TimeoutError as exc:
+            with STATE_LOCK:
+                STATE["pc_monitor_last_error"] = str(exc)
+            LOG.debug("PC monitor sample skipped after serial write timeout: %s", exc)
+            return False
+        except OSError as exc:
+            invalidate_serial(fd, f"PC monitor write failed: {exc}")
+            raise RuntimeError("PC monitor lost the MacroPad serial connection") from exc
+        finally:
+            try:
+                write_lock.release()
+            except RuntimeError:
+                pass
+
         with STATE_LOCK:
-            STATE["pc_monitor_last_error"] = str(exc)
-        LOG.debug("PC monitor sample skipped after serial write timeout: %s", exc)
-        return False
-    except OSError as exc:
-        invalidate_serial(fd, f"PC monitor write failed: {exc}")
-        raise RuntimeError("PC monitor lost the MacroPad serial connection") from exc
+            STATE["pc_monitor_last_sent"] = int(time.time())
+            STATE["pc_monitor_last_error"] = None
+        LOG.debug("PC monitor: sent %d-byte JSON generation=%s", len(body), generation)
+        return True
     finally:
         try:
-            write_lock.release()
+            DEVICE_IO_LOCK.release()
         except RuntimeError:
             pass
 
-    with STATE_LOCK:
-        STATE["pc_monitor_last_sent"] = int(time.time())
-        STATE["pc_monitor_last_error"] = None
-    LOG.debug("PC monitor: sent %d-byte JSON generation=%s", len(body), generation)
-    return True
 
 
 def pc_monitor_loop() -> None:
@@ -2053,7 +2623,9 @@ def pc_monitor_loop() -> None:
             PC_CPU_ENERGY_PREV = None
             pc_cpu_load_percent()
             last_generation = generation
-            next_sample = time.monotonic() + 0.20
+            with STATE_LOCK:
+                ready_at = float(STATE.get("pc_monitor_ready_at") or 0.0)
+            next_sample = max(time.monotonic() + 0.20, ready_at)
 
         now = time.monotonic()
         if pause_until > now:
@@ -2095,48 +2667,43 @@ def activate_profile(profile: int) -> dict[str, Any]:
     if not (1 <= profile <= MAX_PROFILE_UI):
         raise ValueError("Invalid profile")
     payload = f"9{profile}.0"
-    LOG.info("Changing active MacroPad profile: TX %r", payload)
     # Start the guard before the profile command so a pending telemetry sample
     # cannot race the transition. Extend it again after TX to guarantee the
     # full delay is measured from the start of the firmware animation.
     pause_pc_monitor_for_profile_transition(profile)
     serial_payload(payload)
+    LOG.info("Changed active MacroPad profile: TX %r", payload)
     pause_pc_monitor_for_profile_transition(profile)
     with STATE_LOCK:
         STATE["active_profile"] = profile
     return {"ok": True, "profile": profile, "payload": payload}
 
+
 def apply_hid_to_device(profile: int, key: int, alias: str) -> None:
-    # Confirmed by official Configurator captures for HidMode=True:
-    #   a<profile>.<key>
-    #   2<profile>.<key>:<alias>   (or 3<profile>.<key> when alias is empty)
-    # The observed gap between HID mode and alias writes is ~52 ms.
     hid_payload = f"a{profile}.{key}"
     alias_payload = f"2{profile}.{key}:{alias}" if alias else f"3{profile}.{key}"
-    LOG.info("Applying HID/display: TX %r", hid_payload)
-    serial_payload(hid_payload)
-    time.sleep(0.052)
-    LOG.info("Applying HID/display: TX %r", alias_payload)
-    serial_payload(alias_payload)
-    time.sleep(0.10)
+    with DEVICE_IO_LOCK:
+        LOG.info("Applying HID/display: TX %r", hid_payload)
+        serial_payload(hid_payload)
+        time.sleep(0.052)
+        LOG.info("Applying HID/display: TX %r", alias_payload)
+        serial_payload(alias_payload)
+        time.sleep(0.10)
+
+
 
 
 def apply_nonhid_to_device(profile: int, key: int, alias: str) -> None:
-    # Confirmed sequence from the official configurator for HidMode=False:
-    #   b<profile>.<key>
-    #   2<profile>.<key>:<alias>   (or 3<profile>.<key> when alias is empty)
-    #
-    # A real official-configurator trace showed ~52 ms between these two writes.
-    # Keep that cadence; a previous EezOpen build used 250 ms, which did not
-    # reproduce the device's display update behavior.
     hid_payload = f"b{profile}.{key}"
     alias_payload = f"2{profile}.{key}:{alias}" if alias else f"3{profile}.{key}"
-    LOG.info("Applying Non-HID/display: TX %r", hid_payload)
-    serial_payload(hid_payload)
-    time.sleep(0.052)
-    LOG.info("Applying Non-HID/display: TX %r", alias_payload)
-    serial_payload(alias_payload)
-    time.sleep(0.10)
+    with DEVICE_IO_LOCK:
+        LOG.info("Applying Non-HID/display: TX %r", hid_payload)
+        serial_payload(hid_payload)
+        time.sleep(0.052)
+        LOG.info("Applying Non-HID/display: TX %r", alias_payload)
+        serial_payload(alias_payload)
+        time.sleep(0.10)
+
 
 
 def flush_storage(root: Path) -> None:
@@ -2148,71 +2715,6 @@ def flush_storage(root: Path) -> None:
             raise RuntimeError(f"sync -f failed: {proc.stdout.strip()}")
     else:
         os.sync()
-
-
-def _mounted_block_for_root(root: Path) -> Optional[str]:
-    """Return the block device currently mounted at ``root`` (for example /dev/sda)."""
-    target = Path(root)
-    for item in _lsblk_records():
-        for mountpoint in _mountpoints(item):
-            if mountpoint == target:
-                name = str(item.get("name") or "").strip()
-                if name:
-                    return name
-    return None
-
-
-def unmount_storage(root: Path) -> None:
-    """Unmount the MacroPad MSC volume after a completed/flush-safe write.
-
-    EezOpen deliberately unmounts even when the volume was already mounted before
-    the write.  This keeps the FAT filesystem clean so the MacroPad can be
-    physically disconnected after a successful Configurator write without
-    leaving the volume dirty.  CDC/HID remain connected; only the MSC filesystem
-    mount is released.
-    """
-    root = Path(root)
-    device = _mounted_block_for_root(root)
-
-    # If the device disappeared or another actor already unmounted it, treat the
-    # requested post-write state as satisfied and clear stale daemon state.
-    if device is None:
-        LOG.info("USB storage already unmounted after write: %s", root)
-    else:
-        if shutil.which("udisksctl"):
-            cmd = ["udisksctl", "unmount", "-b", device]
-        elif shutil.which("umount"):
-            cmd = ["umount", str(root)]
-        else:
-            raise RuntimeError(
-                "USB write completed, but automatic unmount is unavailable "
-                "(udisksctl/umount not found)"
-            )
-
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              text=True, timeout=12, check=False)
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"USB write completed, but automatic unmount failed for {device}: "
-                f"{proc.stdout.strip()}"
-            )
-        LOG.info("USB storage unmounted after successful write: device=%s root=%s",
-                 device, root)
-
-    with STATE_LOCK:
-        if STATE.get("storage_root") == str(root):
-            STATE["storage_root"] = None
-        source = STATE.get("source_dir")
-        if source and str(source).startswith(str(root) + os.sep):
-            STATE["source_dir"] = None
-        STATE["storage_ready"] = False
-        STATE["storage_error"] = None
-
-
-def flush_and_unmount_storage(root: Path) -> None:
-    """Make MacroPad writes durable, then always release the mounted FAT volume."""
-    flush_storage(root)
-    unmount_storage(root)
 
 
 def current_config_dir() -> Optional[Path]:
@@ -2311,6 +2813,7 @@ def build_hid_files(actions: Any) -> tuple[str, str]:
     return "\n".join(config_lines) + "\n", "\n".join(script_lines)
 
 
+
 def save_hid_key_config(profile: int, key: int, alias: str, actions: Any,
                         icon_path: Optional[str] = None, clear_icon: bool = False) -> dict[str, Any]:
     if not (1 <= profile <= MAX_PROFILE_UI):
@@ -2319,67 +2822,52 @@ def save_hid_key_config(profile: int, key: int, alias: str, actions: Any,
         raise ValueError("Key must be between 1 and 8")
     if any(ch in alias for ch in "\r\n"):
         raise ValueError("Alias cannot contain a newline")
-
     act_content, script_content = build_hid_files(actions)
-
     with STATE_LOCK:
         device_id = STATE.get("id")
         config_dir_raw = STATE.get("config_dir")
-        connected = bool(STATE.get("connected"))
+        connected = bool(STATE.get("connected") and STATE.get("operational"))
     if not device_id or not config_dir_raw:
         raise RuntimeError("No device/cache is selected")
-
     if connected and HOST_MSC_STABILITY_GUARD:
-        raise RuntimeError(
-            "HID script editing is temporarily disabled by the USB Mass Storage "
-            "stability guard. Existing HID keys continue to work normally."
-        )
-
-    root: Optional[Path] = None
-    source: Optional[Path] = None
-    if connected:
-        root = ensure_device_storage(try_mount=True)
-        source = root / "configs"
+        raise RuntimeError("HID script editing is disabled by the USB Mass Storage stability guard")
 
     filename = f"profile_{profile}_key_{key}.txt"
     content = f"Alias={alias}\nHidMode=True\n{act_content}"
     local_path = Path(config_dir_raw) / filename
-    script_dir = local_script_dir(str(device_id))
-    local_script = script_dir / filename
+    local_script = local_script_dir(str(device_id)) / filename
+    device_written = False
+    icon_result: dict[str, Any] = {}
+    serial_applied = False
+    serial_error = None
 
     with OPERATION_LOCK:
-        atomic_write(local_path, content)
-        atomic_write(local_script, script_content)
-        device_written = False
-        if source is not None:
-            write_device_text_direct(source / filename, content)
-            time.sleep(0.12)
-            device_script = root / "scripts" / filename
-            write_device_text_direct(device_script, script_content)
-            LOG.info("USB HID script written: %s (%s bytes)",
-                     device_script, len(script_content.encode("utf-8")))
-            time.sleep(0.08)
-            device_written = True
-
-        icon_result = copy_key_icon(profile, key, icon_path, clear_icon, root)
-        if root is not None:
-            LOG.info("USB HID config written: %s", source / filename)
-            flush_and_unmount_storage(root)
-            # Same save cadence captured before the serial HID-mode write.
-            time.sleep(0.30)
-
-        serial_applied = False
-        serial_error = None
         if connected:
-            try:
-                # Media keys now follow the same HID enable/alias sequence as
-                # every firmware-script HID action. Their MK_* command lives in
-                # scripts/profile_P_key_K.txt, exactly as captured officially.
-                apply_hid_to_device(profile, key, alias)
-                serial_applied = True
-            except Exception as exc:
-                serial_error = str(exc)
-                LOG.exception("HID files were saved to USB, but serial application failed")
+            with DEVICE_IO_LOCK:
+                with device_storage_session(write=True) as root:
+                    source = root / "configs"
+                    atomic_write(local_path, content)
+                    atomic_write(local_script, script_content)
+                    write_device_text_direct(source / filename, content)
+                    time.sleep(0.12)
+                    device_script = root / "scripts" / filename
+                    write_device_text_direct(device_script, script_content)
+                    LOG.info("USB HID script written: %s (%s bytes)", device_script, len(script_content.encode("utf-8")))
+                    time.sleep(0.08)
+                    device_written = True
+                    icon_result = copy_key_icon(profile, key, icon_path, clear_icon, root)
+                    LOG.info("USB HID config written: %s", source / filename)
+                time.sleep(0.30)
+                try:
+                    apply_hid_to_device(profile, key, alias)
+                    serial_applied = True
+                except Exception as exc:
+                    serial_error = str(exc)
+                    LOG.exception("HID files were saved to USB, but serial application failed")
+        else:
+            atomic_write(local_path, content)
+            atomic_write(local_script, script_content)
+            icon_result = copy_key_icon(profile, key, icon_path, clear_icon, None)
         _refresh_view_key_from_cache(str(device_id), profile, key)
 
     with STATE_LOCK:
@@ -2391,8 +2879,11 @@ def save_hid_key_config(profile: int, key: int, alias: str, actions: Any,
             "serial_error": serial_error, **icon_result}
 
 
+
+
 def save_key_config(profile: int, key: int, alias: str, act: str, arg: str,
-                    icon_path: Optional[str] = None, clear_icon: bool = False) -> dict[str, Any]:
+                    icon_path: Optional[str] = None, clear_icon: bool = False,
+                    eezopen_external_script: bool = False) -> dict[str, Any]:
     act = normalize_action_id(act)
     if act not in SUPPORTED_ACTIONS:
         raise ValueError(f"Unsupported ACT: {act}")
@@ -2402,67 +2893,67 @@ def save_key_config(profile: int, key: int, alias: str, act: str, arg: str,
         raise ValueError("Key must be between 1 and 8")
     if any(ch in alias for ch in "\r\n") or any(ch in arg for ch in "\r\n"):
         raise ValueError("Alias/argument cannot contain a newline")
-
     with STATE_LOCK:
         device_id = STATE.get("id")
         config_dir_raw = STATE.get("config_dir")
-        connected = bool(STATE.get("connected"))
+        connected = bool(STATE.get("connected") and STATE.get("operational"))
     if not device_id or not config_dir_raw:
         raise RuntimeError("No device/cache is selected")
 
-    root: Optional[Path] = None
-    source: Optional[Path] = None
-    if connected and not HOST_MSC_STABILITY_GUARD:
-        root = ensure_device_storage(try_mount=True)
-        source = root / "configs"
-
     filename = f"profile_{profile}_key_{key}.txt"
-    content = f"Alias={alias}\nHidMode=False\nACT {act} {arg}\n"
+    metadata = "EezOpenExternalScript=True\n" if eezopen_external_script else ""
+    content = f"Alias={alias}\nHidMode=False\n{metadata}ACT {act} {arg}\n"
+    device_content = device_compatible_config_text(content)
     local_path = Path(config_dir_raw) / filename
-    script_dir = local_script_dir(str(device_id))
-    local_script = script_dir / filename
+    local_script = local_script_dir(str(device_id)) / filename
+    device_written = False
+    icon_result: dict[str, Any] = {}
+    serial_applied = False
+    serial_error = None
+
     with OPERATION_LOCK:
-        atomic_write(local_path, content)
-        # The official configurator always creates the matching scripts file
-        # before writing the per-key icon, even for host-side Non-HID actions
-        # where the script is empty.  The device appears to treat the three
-        # files as one key record, so mirror that layout exactly.
-        atomic_write(local_script, "")
-        device_written = False
-        if source is not None:
-            write_device_text_direct(source / filename, content)
-            time.sleep(0.12)
-            device_script = root / "scripts" / filename
-            write_device_text_direct(device_script, "")
-            LOG.info("USB script written: %s (0 bytes)", device_script)
-            time.sleep(0.08)
-            device_written = True
-
-        icon_result = copy_key_icon(profile, key, icon_path, clear_icon, root)
-        if root is not None:
-            LOG.info("USB config written: %s", source / filename)
-            flush_and_unmount_storage(root)
-            # Official capture: icon close -> b<profile>.<key> was ~297 ms.
-            time.sleep(0.30)
-
-        serial_applied = False
-        serial_error = None
-        if connected:
-            try:
-                apply_nonhid_to_device(profile, key, alias)
-                serial_applied = True
-            except Exception as exc:
-                serial_error = str(exc)
-                LOG.exception("File was saved to USB, but serial application failed")
+        if connected and not HOST_MSC_STABILITY_GUARD:
+            with DEVICE_IO_LOCK:
+                with device_storage_session(write=True) as root:
+                    source = root / "configs"
+                    atomic_write(local_path, content)
+                    atomic_write(local_script, "")
+                    write_device_text_direct(source / filename, device_content)
+                    time.sleep(0.12)
+                    device_script = root / "scripts" / filename
+                    write_device_text_direct(device_script, "")
+                    LOG.info("USB script written: %s (0 bytes)", device_script)
+                    time.sleep(0.08)
+                    device_written = True
+                    icon_result = copy_key_icon(profile, key, icon_path, clear_icon, root)
+                    LOG.info("USB config written: %s", source / filename)
+                time.sleep(0.30)
+                try:
+                    apply_nonhid_to_device(profile, key, alias)
+                    serial_applied = True
+                except Exception as exc:
+                    serial_error = str(exc)
+                    LOG.exception("File was saved to USB, but serial application failed")
+        else:
+            atomic_write(local_path, content)
+            atomic_write(local_script, "")
+            icon_result = copy_key_icon(profile, key, icon_path, clear_icon, None)
+            if connected:
+                try:
+                    apply_nonhid_to_device(profile, key, alias)
+                    serial_applied = True
+                except Exception as exc:
+                    serial_error = str(exc)
         _refresh_view_key_from_cache(str(device_id), profile, key)
 
-    # A newly created profile in the filesystem should become visible in the GUI.
     with STATE_LOCK:
         STATE["profile_count"] = max(int(STATE.get("profile_count") or 1), profile)
         if STATE.get("profile_count_source") not in {"serial", "device-files"}:
             STATE["profile_count_source"] = "files"
-    return {"ok": True, "local_path": str(local_path), "device_written": device_written,
-            "serial_applied": serial_applied, "serial_error": serial_error, **icon_result}
+    return {"ok": True, "local_path": str(local_path), "script_path": str(local_script),
+            "device_written": device_written, "serial_applied": serial_applied,
+            "serial_error": serial_error, **icon_result}
+
 
 
 def save_external_script_key_config(profile: int, key: int, alias: str, script: str, arguments: Any,
@@ -2473,64 +2964,42 @@ def save_external_script_key_config(profile: int, key: int, alias: str, script: 
         raise ValueError("External Script path/arguments cannot contain NUL or newline characters")
     resolve_external_script_executable(script)
     command = shlex.join([script, *arguments])
-    return save_key_config(profile, key, alias, "p", command, icon_path, clear_icon)
+    return save_key_config(profile, key, alias, "2", command, icon_path, clear_icon,
+                           eezopen_external_script=True)
+
 
 
 def delete_key_config(profile: int, key: int) -> dict[str, Any]:
-    """Remove one key record from persistent cache and the connected MacroPad.
-
-    This is intentionally an explicit destructive operation.  It deletes only
-    the per-key config/script/icon triplet, then disables HID for the key and
-    removes its alias using already-confirmed serial commands.
-    """
     if not (1 <= profile <= MAX_PROFILE_UI):
         raise ValueError("Invalid profile")
     if not (1 <= key <= 8):
         raise ValueError("Key must be between 1 and 8")
-
     with STATE_LOCK:
         device_id = str(STATE.get("id") or "")
-        connected = bool(STATE.get("connected"))
+        connected = bool(STATE.get("connected") and STATE.get("operational"))
     if not device_id:
         raise RuntimeError("No device is selected")
     if not connected:
-        raise RuntimeError("Connect the MacroPad to remove the configuration from the device and persistent home cache at the same time")
+        raise RuntimeError("Connect the MacroPad before removing a device configuration")
 
-    root = ensure_device_storage(try_mount=True)
     name_txt = f"profile_{profile}_key_{key}.txt"
     name_png = f"profile_{profile}_key_{key}.png"
-    local_paths = [
-        local_config_dir(device_id) / name_txt,
-        local_script_dir(device_id) / name_txt,
-        local_icon_dir(device_id) / name_png,
-    ]
-    device_paths = [
-        root / "configs" / name_txt,
-        root / "scripts" / name_txt,
-        root / "app_icons" / name_png,
-    ]
-
-    removed_local = 0
-    removed_device = 0
+    local_paths = [local_config_dir(device_id) / name_txt,
+                   local_script_dir(device_id) / name_txt,
+                   local_icon_dir(device_id) / name_png]
+    removed_local = removed_device = 0
     serial_applied = False
     serial_error = None
-
-    with OPERATION_LOCK:
-        for path in local_paths:
-            if path.is_file():
-                path.unlink()
-                removed_local += 1
-        for path in device_paths:
-            if path.is_file():
-                path.unlink()
-                removed_device += 1
-
-        flush_and_unmount_storage(root)
-
-        # Do not invent a new "delete key" opcode.  Use the two commands already
-        # confirmed by normal saves: b disables HID/returns the key to host-side
-        # mode, and 3 removes the display alias.  With no local config, a host-side
-        # event has nothing to execute until the user creates the key again.
+    with OPERATION_LOCK, DEVICE_IO_LOCK:
+        with device_storage_session(write=True) as root:
+            device_paths = [root / "configs" / name_txt, root / "scripts" / name_txt,
+                            root / "app_icons" / name_png]
+            for path in local_paths:
+                if path.is_file():
+                    path.unlink(); removed_local += 1
+            for path in device_paths:
+                if path.is_file():
+                    path.unlink(); removed_device += 1
         try:
             serial_payload(f"b{profile}.{key}")
             time.sleep(0.052)
@@ -2539,22 +3008,14 @@ def delete_key_config(profile: int, key: int) -> dict[str, Any]:
         except Exception as exc:
             serial_error = str(exc)
             LOG.exception("Key files were removed, but serial cleanup failed")
-
         _refresh_view_key_from_cache(device_id, profile, key)
-
-
     LOG.info("Configuration removed: profile=%s key=%s local=%s device=%s serial=%s",
              profile, key, removed_local, removed_device, serial_applied)
-    return {
-        "ok": True,
-        "profile": profile,
-        "key": key,
-        "local_removed": removed_local,
-        "device_removed": removed_device,
-        "files_removed": removed_local + removed_device,
-        "serial_applied": serial_applied,
-        "serial_error": serial_error,
-    }
+    return {"ok": True, "profile": profile, "key": key,
+            "local_removed": removed_local, "device_removed": removed_device,
+            "files_removed": removed_local + removed_device,
+            "serial_applied": serial_applied, "serial_error": serial_error}
+
 
 
 def _remove_device_extras(local_dir: Optional[Path], device_dir: Path, pattern: str) -> int:
@@ -2569,18 +3030,17 @@ def _remove_device_extras(local_dir: Optional[Path], device_dir: Path, pattern: 
     return removed
 
 
+
 def push_to_device() -> dict[str, Any]:
-    """Explicit EezOpen -> device mirror for configurable per-key files."""
+    """Explicit EezOpen -> device mirror with MSC and CDC strictly serialized."""
     with STATE_LOCK:
         device_id = str(STATE.get("id") or "")
         config_raw = STATE.get("config_dir")
         icon_raw = STATE.get("icon_dir")
         script_raw = STATE.get("script_dir")
-        connected = bool(STATE.get("connected"))
+        connected = bool(STATE.get("connected") and STATE.get("operational"))
     if not connected:
-        raise RuntimeError("MacroPad is not connected")
-    root = ensure_device_storage(try_mount=True)
-    source = root / "configs"
+        raise RuntimeError("MacroPad is not operational yet")
     if not config_raw or not Path(config_raw).is_dir():
         raise RuntimeError("Persistent local cache not found")
 
@@ -2588,76 +3048,53 @@ def push_to_device() -> dict[str, Any]:
     local_scripts = Path(script_raw) if script_raw else None
     local_icons = Path(icon_raw) if icon_raw else None
     inferred_profiles = infer_profile_count(config_dir, local_icons, local_scripts)
-
-    # Apply to MacroPad mirrors the local profile topology as well as the files.
-    # The firmware stores profile count separately from configs/app_icons/scripts,
-    # so copying profile_6_* files alone does not create profile 6.
-    profile_result = set_profile_count(inferred_profiles)
-
     written = serial_applied = 0
     serial_errors: list[str] = []
     pending_serial: list[tuple[int, int, str, str, bool]] = []
-    with OPERATION_LOCK:
-        dst_scripts = root / "scripts"
-        dst_scripts.mkdir(exist_ok=True)
 
-        dst_icons = root / "app_icons"
-        dst_icons.mkdir(exist_ok=True)
-
-        scripts_written = 0
-        for local in sorted(config_dir.glob("profile_*_key_*.txt")):
-            copy_device_file_direct(local, source / local.name)
-            # Keep the official key triplet complete: configs + scripts + icon.
-            cfg = parse_config_file(local)
-            is_hid = bool(cfg and cfg.get("hid") is True)
-            script_src = local_scripts / local.name if local_scripts else None
-            if script_src and script_src.is_file():
-                copy_device_file_direct(script_src, dst_scripts / local.name)
-            else:
-                write_device_text_direct(dst_scripts / local.name, "")
-            scripts_written += 1
-            written += 1
-            if cfg:
-                act = normalize_action_id(cfg.get("act", ""))
-                if is_hid or act in SUPPORTED_ACTIONS:
-                    parts = local.stem.split("_")
-                    try:
-                        p, k = int(parts[1]), int(parts[3])
-                        pending_serial.append((p, k, str(cfg.get("alias", "")), local.name,
-                                               is_hid))
-                    except Exception as exc:
-                        serial_errors.append(f"{local.name}: {exc}")
-
-        icons_written = 0
-        if local_icons and local_icons.is_dir():
-            for local in sorted(local_icons.glob("*.png")):
-                if local.is_file():
-                    copy_device_file_direct(local, dst_icons / local.name)
-                    icons_written += 1
-
-        # EezOpen -> Macropad is an explicit mirror. Delete only stale per-key
-        # configurable files *after* all desired files have been written.
-        # Default icons/background and unrelated root files remain untouched.
-        configs_removed = _remove_device_extras(config_dir, source, "profile_*_key_*.txt")
-        scripts_removed = _remove_device_extras(local_scripts, dst_scripts, "profile_*_key_*.txt")
-        icons_removed = _remove_device_extras(local_icons, dst_icons, "profile_*_key_*.png")
-
-        # Refresh the ephemeral view while the filesystem is still mounted.
-        # The persistent HOME cache remains the source of truth.
-        if device_id:
-            _sync_device_view_from_root(root, device_id)
-
-        flush_and_unmount_storage(root)
+    with OPERATION_LOCK, DEVICE_IO_LOCK:
+        with device_storage_session(write=True) as root:
+            source = root / "configs"
+            dst_scripts = root / "scripts"; dst_scripts.mkdir(exist_ok=True)
+            dst_icons = root / "app_icons"; dst_icons.mkdir(exist_ok=True)
+            scripts_written = 0
+            for local in sorted(config_dir.glob("profile_*_key_*.txt")):
+                local_text = local.read_text(encoding="utf-8", errors="replace")
+                write_device_text_direct(source / local.name, device_compatible_config_text(local_text))
+                cfg = parse_config_file(local)
+                is_hid = bool(cfg and cfg.get("hid") is True)
+                script_src = local_scripts / local.name if local_scripts else None
+                if script_src and script_src.is_file():
+                    copy_device_file_direct(script_src, dst_scripts / local.name)
+                else:
+                    write_device_text_direct(dst_scripts / local.name, "")
+                scripts_written += 1; written += 1
+                if cfg:
+                    act = normalize_action_id(cfg.get("act", ""))
+                    if is_hid or act in SUPPORTED_ACTIONS:
+                        parts = local.stem.split("_")
+                        try:
+                            p, k = int(parts[1]), int(parts[3])
+                            pending_serial.append((p, k, str(cfg.get("alias", "")), local.name, is_hid))
+                        except Exception as exc:
+                            serial_errors.append(f"{local.name}: {exc}")
+            icons_written = 0
+            if local_icons and local_icons.is_dir():
+                for local in sorted(local_icons.glob("*.png")):
+                    if local.is_file():
+                        copy_device_file_direct(local, dst_icons / local.name); icons_written += 1
+            configs_removed = _remove_device_extras(config_dir, source, "profile_*_key_*.txt")
+            scripts_removed = _remove_device_extras(local_scripts, dst_scripts, "profile_*_key_*.txt")
+            icons_removed = _remove_device_extras(local_icons, dst_icons, "profile_*_key_*.png")
+            # Refresh while the volume is intentionally mounted.
+            if device_id:
+                _sync_device_view_from_root(root, device_id)
         time.sleep(0.30)
-
-        # Apply serial state only after every config/icon is durable and the FAT
-        # volume has been cleanly unmounted.
+        # Device metadata/commands are applied only after FAT has been flushed and unmounted.
+        profile_result = set_profile_count(inferred_profiles)
         for p, k, alias, filename, is_hid in pending_serial:
             try:
-                if is_hid:
-                    apply_hid_to_device(p, k, alias)
-                else:
-                    apply_nonhid_to_device(p, k, alias)
+                (apply_hid_to_device if is_hid else apply_nonhid_to_device)(p, k, alias)
                 serial_applied += 1
                 time.sleep(0.10)
             except Exception as exc:
@@ -2669,25 +3106,15 @@ def push_to_device() -> dict[str, Any]:
             "serial_applied": serial_applied, "serial_errors": serial_errors,
             "profile_count": int(profile_result.get("profile_count") or inferred_profiles),
             "profile_count_confirmed": bool(profile_result.get("confirmed")),
-            "storage_root": str(root)}
+            "storage_root": None, "storage_unmounted": True}
+
+
 
 def set_profile_count(count: int) -> dict[str, Any]:
-    """Set the total profile count on the MacroPad when it is connected.
-
-    Confirmed in the official Web Configurator: COMMAND = ``m`` + decimal count
-    (for example ``m6``).  The already-confirmed ``l`` query replies ``n=<count>``
-    and is used here to verify the device accepted the new total.
-
-    When no device is connected, EezOpen still allows the local editor count to be
-    changed, but that state is explicitly local-only until a connected add/remove
-    operation sends ``m<count>``.
-    """
     if not (1 <= count <= MAX_PROFILE_UI):
         raise ValueError(f"Profile count must be between 1 and {MAX_PROFILE_UI}")
-
     with STATE_LOCK:
-        connected = bool(STATE.get("connected") and STATE.get("fd") is not None)
-
+        connected = bool(STATE.get("connected") and STATE.get("fd") is not None and STATE.get("operational"))
     if not connected:
         with STATE_LOCK:
             STATE["profile_count"] = count
@@ -2695,22 +3122,18 @@ def set_profile_count(count: int) -> dict[str, Any]:
         return {"ok": True, "requested": count, "confirmed": False,
                 "profile_count": count, "source": "eezopen-local",
                 "note": "MacroPad disconnected; profile count changed only in the local editor."}
-
-    payload = f"m{count}"
-    LOG.info("Changing MacroPad profile count: TX %r", payload)
-    serial_payload(payload)
-    time.sleep(0.10)
-
-    # Verify with the confirmed l -> n=N query so the GUI never claims a profile
-    # exists on the device when only the local editor was updated.
-    result = query_profile_count()
+    with DEVICE_IO_LOCK:
+        payload = f"m{count}"
+        LOG.info("Changing MacroPad profile count: TX %r", payload)
+        serial_payload(payload)
+        time.sleep(0.10)
+        result = query_profile_count()
     confirmed_count = int(result.get("profile_count") or 0)
     if confirmed_count != count:
-        raise RuntimeError(
-            f"MacroPad confirmed {confirmed_count} profiles after requesting {count}")
-
+        raise RuntimeError(f"MacroPad confirmed {confirmed_count} profiles after requesting {count}")
     return {"ok": True, "requested": count, "confirmed": True,
             "profile_count": confirmed_count, "source": result.get("source", "serial")}
+
 
 
 def query_profile_count() -> dict[str, Any]:
@@ -2822,26 +3245,25 @@ def persist_rgb_settings(r: int, g: int, b: int, a: int, mode: int) -> None:
     save_settings(settings)
 
 
+
 def set_rgb(r: int, g: int, b: int, a: int, mode: int) -> dict[str, Any]:
     values = (r, g, b, a)
     if any(v < 0 or v > 255 for v in values):
         raise ValueError("RGBA values must be between 0 and 255")
     if not (0 <= mode < len(RGB_MODES)):
         raise ValueError("Invalid RGB mode")
-
-    # Match the official Configurator's Save_Click order: SetRgbMode first,
-    # SetRgbColor second.  The color payload is uppercase RRGGBB followed by
-    # alpha as a decimal byte string (e.g. 255), not hexadecimal alpha.
     mode_payload = f"j{mode}"
     color_payload = f"1{r:02X}{g:02X}{b:02X}{a}"
-    LOG.info("RGB: TX mode %r", mode_payload)
-    serial_payload(mode_payload)
-    time.sleep(0.25)
-    LOG.info("RGB: TX color %r", color_payload)
-    serial_payload(color_payload)
+    with DEVICE_IO_LOCK:
+        LOG.info("RGB: TX mode %r", mode_payload)
+        serial_payload(mode_payload)
+        time.sleep(0.25)
+        LOG.info("RGB: TX color %r", color_payload)
+        serial_payload(color_payload)
     persist_rgb_settings(r, g, b, a, mode)
     return {"ok": True, "r": r, "g": g, "b": b, "a": a,
             "mode": mode, "mode_name": RGB_MODES[mode]}
+
 
 
 def _screen_script_entry(entry: dict[str, Any], *, require_file: bool = False) -> dict[str, str]:
@@ -2996,33 +3418,39 @@ def _screen_script_argv(path: Path, arguments: str = "") -> list[str]:
 
 
 def _send_cus_stop_to_tty(dev: str) -> None:
-    """Best-effort CUS stop using the daemon-owned serial descriptor."""
+    """Best-effort CUS stop through the same physical-device I/O gate."""
     payload = json.dumps({"cmd": "stop"}, separators=(",", ":")).encode("utf-8")
     packet = b"cus" + len(payload).to_bytes(2, "big") + payload
-    with STATE_LOCK:
-        fd = STATE.get("fd") if STATE.get("connected") else None
-        generation = int(STATE.get("connection_generation") or 0)
-    if fd is None:
-        LOG.warning("Screen Script cleanup skipped CUS stop: MacroPad is disconnected")
-        return
-    write_lock = SERIAL_WRITE_LOCK
-    if not write_lock.acquire(timeout=1.0):
-        LOG.warning("Screen Script cleanup could not acquire serial write lock")
-        return
-    try:
+    with DEVICE_IO_LOCK:
         with STATE_LOCK:
-            if (not STATE.get("connected") or STATE.get("fd") != fd or
-                    int(STATE.get("connection_generation") or 0) != generation):
+            fd = STATE.get("fd") if STATE.get("connected") else None
+            generation = int(STATE.get("connection_generation") or 0)
+            if STATE.get("storage_quarantined"):
+                LOG.warning("Screen Script cleanup skipped CUS stop: MSC is quarantined")
                 return
-        _write_fd_nonblocking(fd, packet, timeout=1.5)
-        LOG.info("Screen Script cleanup: CUS stop sent via daemon serial fd (%s)", dev or "unknown tty")
-    except Exception as exc:
-        LOG.warning("Screen Script cleanup could not send CUS stop: %s", exc)
-    finally:
+        if fd is None:
+            LOG.warning("Screen Script cleanup skipped CUS stop: MacroPad is disconnected")
+            return
+        write_lock = SERIAL_WRITE_LOCK
+        if not write_lock.acquire(timeout=1.0):
+            LOG.warning("Screen Script cleanup could not acquire serial write lock")
+            return
         try:
-            write_lock.release()
-        except RuntimeError:
-            pass
+            with STATE_LOCK:
+                if (not STATE.get("connected") or STATE.get("fd") != fd or
+                        int(STATE.get("connection_generation") or 0) != generation):
+                    return
+            _write_fd_nonblocking(fd, packet, timeout=1.5)
+            with STATE_LOCK:
+                STATE["last_cdc_tx_at"] = time.monotonic()
+            LOG.info("Screen Script cleanup: CUS stop sent via daemon serial fd (%s)", dev or "unknown tty")
+        except Exception as exc:
+            LOG.warning("Screen Script cleanup could not send CUS stop: %s", exc)
+        finally:
+            try:
+                write_lock.release()
+            except RuntimeError:
+                pass
 
 
 def _clear_screen_script_state(returncode: Optional[int], error: Optional[str] = None) -> None:
@@ -3040,12 +3468,15 @@ def _clear_screen_script_state(returncode: Optional[int], error: Optional[str] =
         )
 
 
-def start_screen_script(script_path: str, arguments: str = "", name: str = "") -> dict[str, Any]:
-    """Start one managed Screen Script without releasing the daemon serial port.
 
-    The external script may open the same CDC tty for CUS display writes. EezOpen
-    keeps its descriptor and normal EBF command/event handling alive. PCS telemetry
-    is paused for the duration so it cannot overwrite the Screen Script display.
+def start_screen_script(script_path: str, arguments: str = "", name: str = "") -> dict[str, Any]:
+    """Start one managed Screen Script as the exclusive CDC writer.
+
+    The daemon intentionally keeps its descriptor open only so it can continue
+    receiving key events for host-side actions. While the script is active, all
+    daemon CDC transmissions (including PC Monitor) and all MSC operations are
+    blocked. This preserves existing direct-PySerial Screen Scripts without two
+    independent writers fighting over the firmware.
     """
     global SCREEN_SCRIPT_PROCESS
     path = Path(str(script_path or "").strip()).expanduser().resolve(strict=True)
@@ -3055,16 +3486,27 @@ def start_screen_script(script_path: str, arguments: str = "", name: str = "") -
     argv = _screen_script_argv(path, arguments)
     display_name = str(name or path.stem or path.name).strip()
 
-    with SCREEN_SCRIPT_LOCK:
+    with SCREEN_SCRIPT_LOCK, DEVICE_IO_LOCK:
         if SCREEN_SCRIPT_PROCESS is not None and SCREEN_SCRIPT_PROCESS.poll() is None:
             raise RuntimeError("A Screen Script is already running")
         with STATE_LOCK:
             if STATE.get("screen_script_active"):
                 raise RuntimeError("A Screen Script is already starting or running")
-            if not STATE.get("connected") or STATE.get("fd") is None:
-                raise RuntimeError("Connect the MacroPad before starting a Screen Script")
+            if not STATE.get("connected") or not STATE.get("operational") or STATE.get("fd") is None:
+                raise RuntimeError("Wait for the MacroPad to become operational before starting a Screen Script")
+            if STATE.get("storage_busy"):
+                raise RuntimeError("Wait for the MacroPad storage operation to finish")
+            usb_sysfs = str(STATE.get("usb_sysfs") or "")
             tty = str(STATE.get("dev") or "")
             device_id = str(STATE.get("id") or "")
+        # Do not start an external CDC writer while the FAT volume is mounted.
+        if usb_sysfs and _usb_block_mounts(usb_sysfs):
+            if not _unmount_usb_mounts_sysfs(usb_sysfs, only_automounts=False):
+                raise RuntimeError("Could not unmount MacroPad storage before starting Screen Script")
+            time.sleep(MSC_POST_UNMOUNT_DELAY)
+        if usb_sysfs and not _wait_for_usb_block_idle(usb_sysfs, timeout=2.0, stable=0.20):
+            raise RuntimeError("MacroPad Mass Storage still has active I/O; Screen Script was not started")
+        with STATE_LOCK:
             STATE["screen_script_active"] = True
             STATE["screen_script_name"] = display_name
             STATE["screen_script_path"] = str(path)
@@ -3074,36 +3516,26 @@ def start_screen_script(script_path: str, arguments: str = "", name: str = "") -
             STATE["screen_script_last_error"] = None
 
         env = os.environ.copy()
-        env.update({
-            "EEZOPEN_TTY": tty,
-            "EEZOPEN_DEVICE_ID": device_id,
-            "EEZOPEN_SCREEN_SCRIPT": "1",
-            "EEZOPEN_SOCKET": str(socket_path()),
-        })
+        env.update({"EEZOPEN_TTY": tty, "EEZOPEN_DEVICE_ID": device_id,
+                    "EEZOPEN_SCREEN_SCRIPT": "1", "EEZOPEN_SOCKET": str(socket_path())})
         log_path = data_root() / "screen-script.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             with log_path.open("ab", buffering=0) as log_fp:
-                proc = subprocess.Popen(
-                    argv,
-                    stdin=subprocess.DEVNULL,
-                    stdout=log_fp,
-                    stderr=subprocess.STDOUT,
-                    shell=False,
-                    start_new_session=True,
-                    env=env,
-                )
+                proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log_fp,
+                                        stderr=subprocess.STDOUT, shell=False,
+                                        start_new_session=True, env=env)
         except Exception as exc:
             _clear_screen_script_state(None, str(exc))
             raise
-
         SCREEN_SCRIPT_PROCESS = proc
         with STATE_LOCK:
             STATE["screen_script_pid"] = proc.pid
-        LOG.info("Screen Script started: pid=%s name=%s path=%s args=%r tty=%s; daemon serial remains active",
-                 proc.pid, display_name, path, arguments, tty)
+        LOG.info("Screen Script started: pid=%s name=%s tty=%s; external script is exclusive CDC writer; daemon remains read-only",
+                 proc.pid, display_name, tty)
         return {"ok": True, "active": True, "name": display_name, "script": str(path),
                 "args": arguments, "pid": proc.pid, "tty": tty}
+
 
 
 def stop_screen_script() -> dict[str, Any]:
@@ -3133,10 +3565,21 @@ def stop_screen_script() -> dict[str, Any]:
                     pass
                 returncode = proc.wait(timeout=2.0)
 
-        _send_cus_stop_to_tty(tty)
+        with DEVICE_IO_LOCK:
+            with STATE_LOCK:
+                daemon_fd = STATE.get("fd") if STATE.get("connected") else None
+            if daemon_fd is not None:
+                try:
+                    configure_serial(daemon_fd)
+                except (OSError, termios.error) as exc:
+                    LOG.warning("Could not restore daemon serial settings after Screen Script: %s", exc)
+            _send_cus_stop_to_tty(tty)
         _clear_screen_script_state(returncode)
+        with STATE_LOCK:
+            STATE["pc_monitor_ready_at"] = time.monotonic() + PC_MONITOR_STARTUP_DELAY
         LOG.info("Screen Script stopped: path=%s returncode=%s; daemon serial stayed active", script, returncode)
         return {"ok": True, "active": False, "script": script, "returncode": returncode}
+
 
 
 def reap_screen_script_if_exited() -> bool:
@@ -3155,11 +3598,22 @@ def reap_screen_script_if_exited() -> bool:
         returncode = proc.poll()
         if returncode is None:
             return True
-        _send_cus_stop_to_tty(tty)
+        with DEVICE_IO_LOCK:
+            with STATE_LOCK:
+                daemon_fd = STATE.get("fd") if STATE.get("connected") else None
+            if daemon_fd is not None:
+                try:
+                    configure_serial(daemon_fd)
+                except (OSError, termios.error) as exc:
+                    LOG.warning("Could not restore daemon serial settings after Screen Script exit: %s", exc)
+            _send_cus_stop_to_tty(tty)
         error = None if returncode == 0 else f"Screen Script exited with code {returncode}"
         _clear_screen_script_state(returncode, error)
+        with STATE_LOCK:
+            STATE["pc_monitor_ready_at"] = time.monotonic() + PC_MONITOR_STARTUP_DELAY
         LOG.info("Screen Script exited: path=%s returncode=%s", script, returncode)
         return False
+
 
 def screen_script_watch_loop() -> None:
     """Reap a Screen Script that exits on its own without affecting CDC runtime."""
@@ -3171,41 +3625,33 @@ def screen_script_watch_loop() -> None:
         time.sleep(0.25)
 
 
+
 def remove_background() -> dict[str, Any]:
-    """Remove both known background BIN files from MacroPad app_icons."""
     with STATE_LOCK:
-        connected = bool(STATE.get("connected") and STATE.get("fd") is not None)
+        connected = bool(STATE.get("connected") and STATE.get("operational"))
         guarded = bool(STATE.get("storage_guarded"))
     if not connected:
-        raise RuntimeError("MacroPad is not connected")
+        raise RuntimeError("MacroPad is not operational yet")
     if guarded:
         raise RuntimeError("MacroPad USB Mass Storage is unavailable")
-
     removed: list[str] = []
     with OPERATION_LOCK:
-        root = ensure_device_storage(try_mount=True)
-        app_icons = root / "app_icons"
-        for filename in sorted(set(BACKGROUND_FILENAMES.values())):
-            target = app_icons / filename
-            try:
-                target.unlink()
-            except FileNotFoundError:
-                continue
-            removed.append(filename)
-        flush_and_unmount_storage(root)
-
+        with device_storage_session(write=True) as root:
+            app_icons = root / "app_icons"
+            for filename in sorted(set(BACKGROUND_FILENAMES.values())):
+                target = app_icons / filename
+                try:
+                    target.unlink()
+                except FileNotFoundError:
+                    continue
+                removed.append(filename)
     LOG.info("Background files removed from MacroPad: %s", removed or "none present")
-    return {"ok": True, "removed": removed, "storage_root": str(root)}
+    return {"ok": True, "removed": removed, "storage_root": None, "storage_unmounted": True}
+
+
 
 
 def install_background(bin_path: str, theme: str) -> dict[str, Any]:
-    """Install one Configurator-generated background BIN on the MacroPad MSC volume.
-
-    This operation is deliberately IPC-driven: normal daemon runtime never scans
-    or writes Mass Storage on its own. Dark -> bg_dark.bin is confirmed from the
-    official configurator. Light -> bg_light.bin is kept as an experimental name
-    until it is confirmed on physical hardware.
-    """
     theme = str(theme or "").lower().strip()
     if theme not in BACKGROUND_FILENAMES:
         raise ValueError("Background theme must be dark or light")
@@ -3214,46 +3660,41 @@ def install_background(bin_path: str, theme: str) -> dict[str, Any]:
         raise FileNotFoundError(f"Converted background file not found: {source}")
     size = source.stat().st_size
     if size != BACKGROUND_BIN_SIZE:
-        raise ValueError(
-            f"Unexpected background BIN size: {size} bytes; expected {BACKGROUND_BIN_SIZE} "
-            f"for {BACKGROUND_WIDTH}x{BACKGROUND_HEIGHT} indexed 4-bit LVGL data"
-        )
+        raise ValueError(f"Unexpected background BIN size: {size} bytes; expected {BACKGROUND_BIN_SIZE}")
     with STATE_LOCK:
-        connected = bool(STATE.get("connected") and STATE.get("fd") is not None)
+        connected = bool(STATE.get("connected") and STATE.get("operational"))
         guarded = bool(STATE.get("storage_guarded"))
     if not connected:
-        raise RuntimeError("MacroPad is not connected")
+        raise RuntimeError("MacroPad is not operational yet")
     if guarded:
         raise RuntimeError("MacroPad USB Mass Storage is unavailable")
-
     filename = BACKGROUND_FILENAMES[theme]
     with OPERATION_LOCK:
-        root = ensure_device_storage(try_mount=True)
-        destination = root / "app_icons" / filename
-        copy_device_file_direct(source, destination)
-        flush_and_unmount_storage(root)
+        with device_storage_session(write=True) as root:
+            destination = root / "app_icons" / filename
+            copy_device_file_direct(source, destination)
+    LOG.info("Background installed: theme=%s source=%s filename=%s", theme, source, filename)
+    return {"ok": True, "theme": theme, "filename": filename, "source": str(source),
+            "destination": filename, "size": size,
+            "light_filename_confirmed": False if theme == "light" else True,
+            "storage_unmounted": True}
 
-    LOG.info("Background installed: theme=%s source=%s destination=%s", theme, source, destination)
-    return {
-        "ok": True, "theme": theme, "filename": filename,
-        "source": str(source), "destination": str(destination), "size": size,
-        "light_filename_confirmed": False if theme == "light" else True,
-    }
+
 
 
 def set_device_theme(theme: str) -> dict[str, Any]:
     theme = theme.lower().strip()
     if theme not in {"dark", "light"}:
         raise ValueError("Theme must be dark or light")
-    serial_payload("h0" if theme == "dark" else "h1")
-    time.sleep(0.25)
-    with STATE_LOCK:
-        fd = STATE.get("fd") if STATE.get("connected") else None
-    serial_payload("c")
-    # Theme change intentionally reboots the device. Drop our descriptor now
-    # instead of waiting for a later write to hit EIO on the old ttyACM node.
-    invalidate_serial(fd, "reboot after theme change")
+    with DEVICE_IO_LOCK:
+        serial_payload("h0" if theme == "dark" else "h1")
+        time.sleep(0.25)
+        with STATE_LOCK:
+            fd = STATE.get("fd") if STATE.get("connected") else None
+        serial_payload("c")
+        invalidate_serial(fd, "reboot after theme change")
     return {"ok": True, "theme": theme, "reboot_sent": True, "reconnecting": True}
+
 
 
 def sha256(path: Path) -> str:
@@ -3287,23 +3728,13 @@ def _observe_firmware_trigger_fd(fd: int, seconds: float = 3.0) -> None:
             LOG.debug("Firmware RX after trigger: %r", data)
 
 
+
 def firmware_update(bin_path: str, json_path: str) -> dict[str, Any]:
-    """Validate/copy firmware and trigger the proven USB-copy update sequence.
-
-    The working Bash updater leaves the normal runtime session, opens a fresh
-    descriptor at 115200, sends only ``ebf 01 n`` and then leaves the device
-    alone while it re-enumerates.  EezOpen mirrors that behavior here.
-
-    Crucially, after the trigger the daemon does *not* probe/authenticate/mount
-    the transient recovery personality.  It waits for the pre-update normal
-    VID:PID to disappear and then reappear before resuming normal operation.
-    """
     bin_src = Path(bin_path).expanduser().resolve()
     json_src = Path(json_path).expanduser().resolve()
     for p in (bin_src, json_src):
         if not p.is_file() or p.is_symlink():
             raise ValueError(f"Invalid file: {p}")
-
     try:
         metadata = json.loads(json_src.read_text(encoding="utf-8"))
         info = metadata["EezBotFunFirmwareInfo"]
@@ -3311,8 +3742,7 @@ def firmware_update(bin_path: str, json_path: str) -> dict[str, Any]:
         raise ValueError(f"Invalid firmware JSON: {exc}") from exc
     if info.get("device") != "mc-08":
         raise ValueError("JSON is not for the mc-08 device")
-    version = info.get("version")
-    expected_size = info.get("size")
+    version = info.get("version"); expected_size = info.get("size")
     if isinstance(version, bool) or not isinstance(version, int) or version < 0:
         raise ValueError("Invalid version in JSON")
     if isinstance(expected_size, bool) or not isinstance(expected_size, int) or expected_size <= 0:
@@ -3322,51 +3752,31 @@ def firmware_update(bin_path: str, json_path: str) -> dict[str, Any]:
         raise ValueError(f"BIN size mismatch: JSON={expected_size}, BIN={actual_size}")
 
     with STATE_LOCK:
-        connected = bool(STATE.get("connected"))
+        connected = bool(STATE.get("connected") and STATE.get("operational"))
         fd = STATE.get("fd") if connected else None
         dev = STATE.get("dev")
-        normal_vid = STATE.get("usb_vid")
-        normal_pid = STATE.get("usb_pid")
+        normal_vid = STATE.get("usb_vid"); normal_pid = STATE.get("usb_pid")
     if not connected or fd is None or not dev:
-        raise RuntimeError("MacroPad is not connected")
+        raise RuntimeError("MacroPad is not operational yet")
 
-    root = ensure_device_storage(try_mount=True)
-    dst_bin = root / "mc-08.bin"
-    dst_json = root / "mc-08.json"
-
-    with OPERATION_LOCK:
-        copy_file_fsync(bin_src, dst_bin)
-        copy_file_fsync(json_src, dst_json)
-
-        # Verify the exact bytes that landed on the USB volume.
-        if sha256(bin_src) != sha256(dst_bin):
-            raise RuntimeError("Verification failed: mc-08.bin on the MacroPad differs from the source")
-        if sha256(json_src) != sha256(dst_json):
-            raise RuntimeError("Verification failed: mc-08.json on the MacroPad differs from the source")
-
-        # Firmware files must be fully durable and the FAT volume cleanly
-        # unmounted before asking the device to reboot into update mode.
-        flush_and_unmount_storage(root)
-
-        # Arm the guard *before* closing the runtime descriptor, so the main
-        # reconnect loop cannot race us and open recovery mode.
+    with OPERATION_LOCK, DEVICE_IO_LOCK:
+        with device_storage_session(write=True) as root:
+            dst_bin = root / "mc-08.bin"; dst_json = root / "mc-08.json"
+            copy_file_fsync(bin_src, dst_bin); copy_file_fsync(json_src, dst_json)
+            if sha256(bin_src) != sha256(dst_bin):
+                raise RuntimeError("Verification failed: mc-08.bin on the MacroPad differs from the source")
+            if sha256(json_src) != sha256(dst_json):
+                raise RuntimeError("Verification failed: mc-08.json on the MacroPad differs from the source")
+        # FAT is now clean and unmounted. Arm reconnect guard before closing CDC.
         with STATE_LOCK:
             STATE["firmware_waiting_for_normal"] = True
             STATE["firmware_expected_vid"] = normal_vid
             STATE["firmware_expected_pid"] = normal_pid
             STATE["firmware_seen_transition"] = False
             STATE["firmware_wait_started"] = time.monotonic()
-            STATE["storage_root"] = None
-            STATE["source_dir"] = None
-            STATE["storage_ready"] = False
             STATE["storage_error"] = "Firmware update in progress; waiting for normal mode to return"
-
-        # Stop the 460800 runtime reader first.  Reconfiguring the same fd while
-        # run_connected() is selecting/reading it is a race that the Bash updater
-        # does not have.
         invalidate_serial(fd, "preparing firmware update")
         time.sleep(0.05)
-
         update_fd: Optional[int] = None
         try:
             update_fd = os.open(str(dev), os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
@@ -3376,37 +3786,22 @@ def firmware_update(bin_path: str, json_path: str) -> dict[str, Any]:
             LOG.info("Firmware TX HEX: 65 62 66 01 6e")
             _observe_firmware_trigger_fd(update_fd, 3.0)
         except (OSError, termios.error, TimeoutError) as exc:
-            # If the trigger itself could not be written, cancel the guard so
-            # normal detection can recover immediately.
             with STATE_LOCK:
                 STATE["firmware_waiting_for_normal"] = False
-                STATE["firmware_expected_vid"] = None
-                STATE["firmware_expected_pid"] = None
-                STATE["firmware_seen_transition"] = False
-                STATE["firmware_wait_started"] = None
+                STATE["firmware_expected_vid"] = None; STATE["firmware_expected_pid"] = None
+                STATE["firmware_seen_transition"] = False; STATE["firmware_wait_started"] = None
             raise RuntimeError(f"Failed to send firmware trigger at 115200: {exc}") from exc
         finally:
             if update_fd is not None:
-                try:
-                    os.close(update_fd)
-                except OSError:
-                    pass
+                try: os.close(update_fd)
+                except OSError: pass
+    return {"ok": True, "device": "mc-08", "version": version, "size": actual_size,
+            "usb_root": None, "bin_sha256": sha256(bin_src), "json_sha256": sha256(json_src),
+            "trigger_sent": True, "trigger_baud": 115200, "trigger_hex": "65 62 66 01 6e",
+            "reconnecting": True, "normal_usb": f"{normal_vid or '?'}:{normal_pid or '?'}",
+            "storage_unmounted": True,
+            "note": "Firmware files verified and FAT unmounted before frame n; EezOpen waits for normal USB mode to return."}
 
-    return {
-        "ok": True,
-        "device": "mc-08",
-        "version": version,
-        "size": actual_size,
-        "usb_root": str(root),
-        "bin_sha256": sha256(bin_src),
-        "json_sha256": sha256(json_src),
-        "trigger_sent": True,
-        "trigger_baud": 115200,
-        "trigger_hex": "65 62 66 01 6e",
-        "reconnecting": True,
-        "normal_usb": f"{normal_vid or '?'}:{normal_pid or '?'}",
-        "note": "Frame n sent through a fresh descriptor at 115200; EezOpen will remain inactive until normal USB mode returns.",
-    }
 
 
 def handle_message(msg: str, config_dir: Path) -> None:
@@ -3459,6 +3854,12 @@ def state_snapshot() -> dict[str, Any]:
             "safe_mode": bool(STATE.get("safe_mode")),
             "usb_vid": STATE.get("usb_vid"), "usb_pid": STATE.get("usb_pid"),
             "authenticated": bool(STATE.get("authenticated")),
+            "operational": bool(STATE.get("operational")),
+            "startup_phase": STATE.get("startup_phase"),
+            "startup_detail": STATE.get("startup_detail"),
+            "storage_busy": bool(STATE.get("storage_busy")),
+            "storage_quarantined": bool(STATE.get("storage_quarantined")),
+            "storage_quarantine_reason": STATE.get("storage_quarantine_reason"),
             "connection_generation": int(STATE.get("connection_generation") or 0),
             "pc_monitor_enabled": bool(STATE.get("pc_monitor_enabled")),
             "pc_monitor_interval": float(STATE.get("pc_monitor_interval") or PC_MONITOR_INTERVAL),
@@ -3486,11 +3887,33 @@ def key_record(profile: int, key: int) -> dict[str, Any]:
     cfg = read_config(cfgdir, profile, key)
     if cfg is not None:
         cfg["icon_path"] = str(icon) if icon else None
-        if normalize_action_id(cfg.get("act", "")) == "p":
+
+        # A refreshed device view contains the compatible ACT 2 representation
+        # and intentionally has no EezOpen-only marker. If the persistent HOME
+        # cache still identifies the same command as External Script, overlay
+        # that local semantic metadata for the GUI only.
+        if (normalize_action_id(cfg.get("act", "")) == "2"
+                and cfg.get("eezopen_external_script") is not True):
+            with STATE_LOCK:
+                did = str(STATE.get("id") or "")
+            if did:
+                local_cfg = read_config(local_config_dir(did), profile, key)
+                if (local_cfg
+                        and local_cfg.get("eezopen_external_script") is True
+                        and normalize_action_id(local_cfg.get("act", "")) == "2"
+                        and str(local_cfg.get("arg", "")) == str(cfg.get("arg", ""))):
+                    cfg["eezopen_external_script"] = True
+
+        is_external_script = (cfg.get("eezopen_external_script") is True
+                              or normalize_action_id(cfg.get("act", "")) == "p")
+        if is_external_script:
             try:
                 script, arguments = parse_external_script_command(str(cfg.get("arg", "")))
             except ValueError:
                 script, arguments = "", []
+            # "p" remains a virtual GUI action ID only. It is never required
+            # on the physical MacroPad in v1.4.3.
+            cfg["act"] = "p"
             cfg["external_script"] = script
             cfg["external_script_args"] = arguments
     return {"key": key, "config": cfg, "icon_path": str(icon) if icon else None}
@@ -3623,7 +4046,14 @@ def ipc_client_handler(conn: socket.socket) -> None:
         except Exception as exc:
             LOG.warning("IPC %r failed: %s", req.get("cmd"), exc)
             resp = {"ok": False, "error": str(exc)}
-        conn.sendall((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
+        try:
+            conn.sendall((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
+        except (BrokenPipeError, ConnectionResetError):
+            # The GTK client may have timed out or closed while a hardware
+            # operation was still completing. This is not a daemon fault and
+            # must not produce a traceback or affect the device session.
+            LOG.debug("IPC client disconnected before reply: cmd=%r", req.get("cmd"))
+            return
     except Exception:
         LOG.exception("IPC client error")
     finally:
@@ -3656,81 +4086,79 @@ def ipc_server() -> None:
         path.unlink(missing_ok=True)
 
 
+
 def set_connected_state(device, config_dir: Path, source_dir: Optional[Path]) -> None:
     serial_count = device.get("profile_count")
     safe_mode = is_safe_mode_usb(device.get("usb_vid"), device.get("usb_pid"))
-    icons = local_icon_dir(device["id"])
-    scripts = local_script_dir(device["id"])
+    icons = local_icon_dir(device["id"]); scripts = local_script_dir(device["id"])
     with STATE_LOCK:
-        view_config_raw = STATE.get("view_config_dir")
-        view_icon_raw = STATE.get("view_icon_dir")
+        view_config_raw = STATE.get("view_config_dir"); view_icon_raw = STATE.get("view_icon_dir")
     infer_configs = Path(view_config_raw) if view_config_raw else config_dir
     infer_icons = Path(view_icon_raw) if view_icon_raw else icons
     inferred = infer_profile_count(infer_configs, infer_icons, scripts)
     effective = int(serial_count) if serial_count is not None else inferred
-    # Every successful detection is a new serial session, even if Linux reused
-    # the same /dev/ttyACM number.  Give it a fresh write queue.
     reset_serial_write_lock("new serial session")
     with STATE_LOCK:
         generation = int(STATE.get("connection_generation") or 0) + 1
         STATE.update({
-            "connected": True, "fd": device["fd"], "dev": device["dev"],
-            "type": device["type"], "id": device["id"],
-            # Persistent home cache. Configurator-driven imports never overwrite it automatically.
+            "connected": True, "operational": True, "startup_phase": "operational",
+            "startup_detail": "USB settled; CDC probe/auth complete",
+            "fd": device["fd"], "dev": device["dev"], "type": device["type"], "id": device["id"],
             "config_dir": str(config_dir), "icon_dir": str(icons), "script_dir": str(scripts),
-            "source_dir": str(source_dir) if source_dir else STATE.get("source_dir"),
+            "source_dir": str(source_dir) if source_dir else None,
             "usb_sysfs": device.get("usb_sysfs"), "usb_vid": device.get("usb_vid"),
             "usb_pid": device.get("usb_pid"), "usb_serial": device.get("usb_serial"),
-            "safe_mode": safe_mode,
-            "storage_guarded": HOST_MSC_STABILITY_GUARD or safe_mode,
-            "authenticated": bool(device.get("authenticated")),
-            "connection_generation": generation,
-            "profile_count": effective,
-            "profile_count_source": "serial" if serial_count is not None else "files",
-            "pc_monitor_last_error": None,
+            "safe_mode": safe_mode, "storage_guarded": HOST_MSC_STABILITY_GUARD or safe_mode,
+            "authenticated": bool(device.get("authenticated")), "connection_generation": generation,
+            "profile_count": effective, "profile_count_source": "serial" if serial_count is not None else "files",
+            "pc_monitor_last_error": None, "pc_monitor_ready_at": time.monotonic() + PC_MONITOR_STARTUP_DELAY,
+            "storage_busy": False, "storage_quarantined": False,
+            "storage_quarantine_reason": None, "last_cdc_tx_at": time.monotonic(),
         })
         if serial_count:
             STATE["profile_generation"] = int(STATE.get("profile_generation", 0)) + 1
-    LOG.info("Serial session active: generation=%s dev=%s", generation, device.get("dev"))
+    LOG.info("Serial session operational: generation=%s dev=%s; PC Monitor held for %.1fs",
+             generation, device.get("dev"), PC_MONITOR_STARTUP_DELAY)
     finish_firmware_reconnect_guard()
 
 
+
+
 def prime_device_identity(device: dict[str, Any]) -> None:
-    """Expose fresh physical USB identity before the serial session becomes active."""
     safe_mode = is_safe_mode_usb(device.get("usb_vid"), device.get("usb_pid"))
     with STATE_LOCK:
         STATE.update({
             "dev": device.get("dev"), "type": device.get("type"), "id": device.get("id"),
             "usb_sysfs": device.get("usb_sysfs"), "usb_vid": device.get("usb_vid"),
             "usb_pid": device.get("usb_pid"), "usb_serial": device.get("usb_serial"),
-            "safe_mode": safe_mode,
-            "storage_guarded": HOST_MSC_STABILITY_GUARD or safe_mode,
-            "authenticated": bool(device.get("authenticated")),
-            "storage_ready": False,
-            "storage_error": (
-                "Safe Mode: USB Mass Storage is disabled" if safe_mode else
-                "USB Mass Storage disabled by EezOpen stability guard" if HOST_MSC_STABILITY_GUARD else None
-            ),
+            "safe_mode": safe_mode, "storage_guarded": HOST_MSC_STABILITY_GUARD or safe_mode,
+            "authenticated": bool(device.get("authenticated")), "operational": False,
+            "startup_phase": "serial-detected", "startup_detail": "CDC identity confirmed; activating runtime session",
+            "storage_ready": False, "storage_busy": False,
+            "storage_quarantined": False, "storage_quarantine_reason": None,
+            "last_cdc_tx_at": time.monotonic(),
+            "storage_error": "Safe Mode: USB Mass Storage is disabled" if safe_mode else None,
             "view_config_dir": None, "view_icon_dir": None, "view_script_dir": None,
         })
+
+
 
 
 def mark_disconnected() -> None:
     reset_serial_write_lock("device disconnected")
     with STATE_LOCK:
-        STATE["connected"] = False
-        STATE["fd"] = None
-        STATE["dev"] = None
-        STATE["type"] = None
-        STATE["usb_sysfs"] = None
-        STATE["usb_vid"] = None
-        STATE["usb_pid"] = None
-        STATE["usb_serial"] = None
-        STATE["safe_mode"] = False
+        STATE["connected"] = False; STATE["operational"] = False
+        STATE["fd"] = None; STATE["dev"] = None; STATE["type"] = None
+        STATE["usb_sysfs"] = None; STATE["usb_vid"] = None; STATE["usb_pid"] = None
+        STATE["usb_serial"] = None; STATE["safe_mode"] = False
         STATE["storage_guarded"] = HOST_MSC_STABILITY_GUARD
-        STATE["authenticated"] = False
-        STATE["storage_ready"] = False
-        STATE["storage_error"] = None
+        STATE["authenticated"] = False; STATE["storage_ready"] = False
+        STATE["storage_busy"] = False; STATE["storage_error"] = None
+        STATE["storage_quarantined"] = False; STATE["storage_quarantine_reason"] = None
+        STATE["last_cdc_tx_at"] = 0.0
+        STATE["pc_monitor_ready_at"] = 0.0
+        STATE["startup_phase"] = "waiting"; STATE["startup_detail"] = None
+
 
 
 def run_connected(device) -> None:

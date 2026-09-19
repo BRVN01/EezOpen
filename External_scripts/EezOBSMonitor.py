@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EezOBS Monitor - OBS Studio status monitor for the EezBotFun 8-Key MacroPad
+EezOBS - OBS Studio status monitor for the EezBotFun 8-Key MacroPad
 
 Part of the EezOpen project.
 
@@ -73,6 +73,150 @@ BORDER = "#294154"
 
 MAX_AUDIO_SOURCES = 6
 AUDIO_DISCOVERY_INTERVAL = 10.0
+
+DEFAULT_OBS_HOST = "192.168.1.20"
+DEFAULT_OBS_PORT = 4444
+
+
+def load_config(path: str) -> dict:
+    """
+    Load a simple EezOBS configuration file.
+
+    Supported keys:
+
+        obs-host=192.168.1.20
+        obs-port=4455
+        obs-password=secret
+        audio-source=Mic/Aux
+        audio-source=Desktop Audio
+
+    ``audio-source`` may be repeated. Blank lines and lines beginning with
+    ``#`` or ``;`` are ignored.
+    """
+
+    config_path = os.path.abspath(os.path.expanduser(path))
+    config: dict[str, object] = {
+        "audio-source": [],
+    }
+
+    allowed = {
+        "obs-host",
+        "obs-port",
+        "obs-password",
+        "audio-source",
+    }
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            for lineno, raw_line in enumerate(handle, 1):
+                line = raw_line.strip()
+
+                if not line or line.startswith(("#", ";")):
+                    continue
+
+                if "=" not in line:
+                    raise ValueError(
+                        f"{config_path}:{lineno}: expected key=value"
+                    )
+
+                key, value = line.split("=", 1)
+                key = key.strip().lower()
+                value = value.strip()
+
+                if key not in allowed:
+                    raise ValueError(
+                        f"{config_path}:{lineno}: unsupported option {key!r}"
+                    )
+
+                if key == "audio-source":
+                    if not value:
+                        raise ValueError(
+                            f"{config_path}:{lineno}: audio-source cannot be empty"
+                        )
+                    audio_sources = config["audio-source"]
+                    assert isinstance(audio_sources, list)
+                    audio_sources.append(value)
+                    continue
+
+                if key == "obs-port":
+                    try:
+                        port = int(value)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"{config_path}:{lineno}: obs-port must be an integer"
+                        ) from exc
+
+                    if not 1 <= port <= 65535:
+                        raise ValueError(
+                            f"{config_path}:{lineno}: obs-port must be between 1 and 65535"
+                        )
+
+                    config[key] = port
+                    continue
+
+                config[key] = value
+
+    except OSError as exc:
+        raise ValueError(f"Unable to read config file {config_path}: {exc}") from exc
+
+    return config
+
+
+def resolve_obs_settings(args: argparse.Namespace) -> None:
+    """
+    Resolve OBS settings while keeping command-line arguments available.
+
+    Precedence, from highest to lowest:
+
+        command line > config file > environment > built-in defaults
+
+    If at least one ``--audio-source`` is supplied on the command line, the
+    command-line list replaces the list from the config file. This makes it
+    easy to test individual sources without editing the config.
+    """
+
+    config: dict[str, object] = {}
+
+    if args.config:
+        config = load_config(args.config)
+
+    if args.obs_host is None:
+        args.obs_host = str(
+            config.get(
+                "obs-host",
+                os.environ.get("OBS_HOST", DEFAULT_OBS_HOST),
+            )
+        )
+
+    if args.obs_port is None:
+        raw_port = config.get(
+            "obs-port",
+            os.environ.get("OBS_PORT", str(DEFAULT_OBS_PORT)),
+        )
+        try:
+            args.obs_port = int(raw_port)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid OBS port: {raw_port!r}") from exc
+
+    if not 1 <= args.obs_port <= 65535:
+        raise ValueError("OBS port must be between 1 and 65535")
+
+    if args.obs_password is None:
+        args.obs_password = str(
+            config.get(
+                "obs-password",
+                os.environ.get("OBS_PASSWORD", ""),
+            )
+        )
+
+    if args.audio_source is None:
+        configured_sources = config.get("audio-source", [])
+        if isinstance(configured_sources, list):
+            args.audio_source = [str(name) for name in configured_sources]
+        else:
+            args.audio_source = []
+
+    args.audio_source = args.audio_source[:MAX_AUDIO_SOURCES]
 
 
 def find_macropad_port() -> str:
@@ -473,8 +617,8 @@ def draw(
 
     # Recording card: bottom-left.
     if state.recording == "RECORDING":
-        rec_fg = GREEN
-        rec_bg = LIVE_BG
+        rec_fg = RED
+        rec_bg = REC_BG
         rec_status = "RECORDING"
     elif state.recording == "PAUSED":
         rec_fg = YELLOW
@@ -539,29 +683,47 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--config",
+        metavar="FILE",
+        help=(
+            "Load OBS connection/audio settings from a config file. "
+            "Command-line options override values from the file."
+        ),
+    )
+
+    parser.add_argument(
         "--obs-host",
-        default=os.environ.get("OBS_HOST", "192.168.1.20"),
-        help="OBS WebSocket host (default: %(default)s)",
+        default=None,
+        help=(
+            "OBS WebSocket host. Overrides config file/OBS_HOST environment."
+        ),
     )
     parser.add_argument(
         "--obs-port",
         type=int,
-        default=int(os.environ.get("OBS_PORT", "4444")),
-        help="OBS WebSocket port (default: %(default)s)",
+        default=None,
+        help=(
+            "OBS WebSocket port. Overrides config file/OBS_PORT environment."
+        ),
     )
     parser.add_argument(
         "--obs-password",
-        default=os.environ.get("OBS_PASSWORD", ""),
-        help="OBS WebSocket password; OBS_PASSWORD env var is also supported",
+        default=None,
+        help=(
+            "OBS WebSocket password. Overrides config file/OBS_PASSWORD "
+            "environment."
+        ),
     )
     parser.add_argument(
         "--audio-source",
         action="append",
-        default=[],
+        default=None,
         metavar="NAME",
         help=(
             "Audio source to display. Repeat the option to choose multiple "
-            "sources and their order. If omitted, sources are auto-discovered."
+            "sources and their order. If supplied, this list overrides audio "
+            "sources from the config file. If omitted everywhere, sources "
+            "are auto-discovered."
         ),
     )
     parser.add_argument(
@@ -597,6 +759,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+
+    try:
+        resolve_obs_settings(args)
+    except ValueError as exc:
+        print(f"Configuration error: {exc}")
+        return 2
 
     monitor = ObsMonitor(
         host=args.obs_host,

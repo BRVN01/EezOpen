@@ -83,6 +83,10 @@ Useful official links:
 
 ## Why EezOpen?
 
+> [!NOTE]
+> For ezopen to work optimally, install firmware version 39.
+>
+
 The EezBotFun MacroPad already works on Linux as a standard HID device, and EezBotFun provides both a web configurator and an official desktop
 configuration application.
 

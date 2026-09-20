@@ -12,7 +12,7 @@ Description:
 
     Displays OBS Studio audio sources, current scene and recording status
     on the MacroPad LCD using the EezBotFun Customised Display USB CDC
-    Grid layout available and validated with firmware v39.
+    Grid layout validated with firmware v39.
 
     OBS Studio status is read through the OBS WebSocket v5 API.
 
@@ -252,6 +252,257 @@ def send_cus(ser: serial.Serial, obj: dict) -> None:
         raise IOError(f"Short write: {written}/{len(frame)}")
 
 
+def panel(
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    text: str,
+    *,
+    fg: str = WHITE,
+    bg: str = BG,
+    align: str = "CENTER",
+    cmd: str = "update",
+    border: int = 0,
+    border_color: str = BORDER,
+    clear_canvas: bool = False,
+) -> dict:
+    obj = {
+        "cmd": cmd,
+        "x": x,
+        "y": y,
+        "w": w,
+        "h": h,
+        "text": text,
+        "fg": fg,
+        "bg": bg,
+        "align": align,
+        "long_mode": "CLIP",
+    }
+
+    if border:
+        obj["border"] = border
+        obj["border-color"] = border_color
+        obj["border-radius"] = 4
+
+    if clear_canvas:
+        obj["clear_canvas"] = True
+
+    return obj
+
+
+def compact_timecode(value: Optional[str]) -> str:
+    if not value:
+        return ""
+
+    value = str(value)
+
+    if "." in value:
+        value = value.split(".", 1)[0]
+
+    return value
+
+
+def shorten(value: str, max_len: int) -> str:
+    value = str(value).strip()
+
+    if len(value) <= max_len:
+        return value
+
+    if max_len <= 3:
+        return value[:max_len]
+
+    return value[: max_len - 3] + "..."
+
+
+class ObsState:
+    def __init__(self) -> None:
+        self.connected = False
+        self.scene = "NO CONNECTION"
+        self.recording = "UNKNOWN"
+        self.record_time = ""
+        self.audio_sources: list[tuple[str, Optional[bool]]] = []
+        self.error = ""
+
+
+class ObsMonitor:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        password: str,
+        timeout: float,
+        audio_sources: Optional[list[str]] = None,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.password = password
+        self.timeout = timeout
+        self.client = None
+
+        self.explicit_audio_sources = list(audio_sources or [])
+        self.discovered_audio_sources: list[str] = []
+        self.last_audio_discovery = 0.0
+
+    def connect(self) -> None:
+        self.client = obs.ReqClient(
+            host=self.host,
+            port=self.port,
+            password=self.password,
+            timeout=self.timeout,
+        )
+
+    def disconnect(self) -> None:
+        client = self.client
+        self.client = None
+
+        if client is None:
+            return
+
+        try:
+            if hasattr(client, "disconnect"):
+                client.disconnect()
+        except Exception:
+            pass
+
+    def _get_input_names(self) -> list[str]:
+        assert self.client is not None
+
+        names: list[str] = []
+
+        try:
+            response = self.client.get_input_list()
+            items = getattr(response, "inputs", None)
+
+            if items is None:
+                raise AttributeError("GetInputList response has no 'inputs'")
+        except Exception:
+            raw = self.client.send("GetInputList", raw=True)
+
+            if isinstance(raw, dict):
+                items = raw.get("inputs", [])
+            else:
+                items = []
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            name = item.get("inputName") or item.get("input_name")
+
+            if name and name not in names:
+                names.append(str(name))
+
+        return names
+
+    def discover_audio_sources(self) -> list[str]:
+        assert self.client is not None
+
+        audio_sources: list[str] = []
+
+        for name in self._get_input_names():
+            try:
+                self.client.get_input_mute(name)
+            except Exception:
+                # Inputs without audio normally do not provide a mute state.
+                continue
+
+            audio_sources.append(name)
+
+            if len(audio_sources) >= MAX_AUDIO_SOURCES:
+                break
+
+        self.discovered_audio_sources = audio_sources
+        self.last_audio_discovery = time.monotonic()
+
+        return audio_sources
+
+    def current_audio_sources(self) -> list[str]:
+        if self.explicit_audio_sources:
+            return self.explicit_audio_sources[:MAX_AUDIO_SOURCES]
+
+        now = time.monotonic()
+
+        if (
+            not self.discovered_audio_sources
+            or now - self.last_audio_discovery >= AUDIO_DISCOVERY_INTERVAL
+        ):
+            return self.discover_audio_sources()
+
+        return self.discovered_audio_sources[:MAX_AUDIO_SOURCES]
+
+    def list_audio_sources(self) -> list[str]:
+        if self.client is None:
+            self.connect()
+
+        return self.discover_audio_sources()
+
+    def read(self) -> ObsState:
+        state = ObsState()
+
+        if self.client is None:
+            self.connect()
+
+        assert self.client is not None
+
+        try:
+            scene_resp = self.client.get_current_program_scene()
+
+            scene = getattr(scene_resp, "scene_name", None)
+            if not scene:
+                scene = getattr(
+                    scene_resp,
+                    "current_program_scene_name",
+                    "UNKNOWN",
+                )
+
+            record_resp = self.client.get_record_status()
+
+            output_active = bool(
+                getattr(record_resp, "output_active", False)
+            )
+            output_paused = bool(
+                getattr(record_resp, "output_paused", False)
+            )
+
+            if not output_active:
+                recording = "STOPPED"
+            elif output_paused:
+                recording = "PAUSED"
+            else:
+                recording = "RECORDING"
+
+            record_time = compact_timecode(
+                getattr(record_resp, "output_timecode", "")
+            )
+
+            audio_states: list[tuple[str, Optional[bool]]] = []
+
+            for name in self.current_audio_sources():
+                try:
+                    mute_resp = self.client.get_input_mute(name)
+                    muted = bool(
+                        getattr(mute_resp, "input_muted", False)
+                    )
+                except Exception:
+                    muted = None
+
+                audio_states.append((name, muted))
+
+            state.connected = True
+            state.scene = str(scene)
+            state.recording = recording
+            state.record_time = record_time
+            state.audio_sources = audio_states
+
+            return state
+
+        except Exception as exc:
+            self.disconnect()
+            state.error = str(exc)
+            return state
+
+
 def audio_card_style(muted: Optional[bool]) -> tuple[str, str, str]:
     if muted is True:
         return RED, REC_BG, "MUTED"
@@ -271,8 +522,8 @@ def build_grid_widgets(
     """
     Build the initial 480x200 Grid layout.
 
-    fullscreen=False intentionally preserves the firmware-owned lower key area.
-    Firmware v39 was used to validate the Grid layout.
+    fullscreen=False preserves the firmware-owned lower key area.
+    Grid behavior was validated on firmware v39.
     """
 
     header_fg = GREEN if state.connected else RED
@@ -406,12 +657,9 @@ def start_grid(
     """
     Create the Grid once.
 
-    The dimensions mirror the old Absolute layout:
-      row 0    -> header
-      rows 1-3 -> six audio cards
-      row 4    -> REC / SCENE
-
-    The whole layout remains inside the normal 480x200 custom display area.
+    row 0    -> header
+    rows 1-3 -> six audio cards
+    row 4    -> REC / SCENE
     """
 
     send_cus(
@@ -444,8 +692,7 @@ def build_grid_updates(
     """
     Build one consolidated update for all dynamic widgets.
 
-    Unlike the old Absolute renderer, this is sent as one Grid update frame
-    instead of many independent serial writes.
+    This replaces the previous series of independent Absolute-mode writes.
     """
 
     header_fg = GREEN if state.connected else RED
@@ -576,9 +823,8 @@ def draw(
     """
     Firmware-v39 Grid renderer.
 
-    The Grid is created once and subsequent refreshes update widgets by ID in
-    one serial frame. This avoids the multiple independent Absolute-mode writes
-    used by the previous version.
+    The Grid is created only once. Later refreshes update widgets by ID in a
+    single serial frame, instead of sending many Absolute-mode updates.
     """
 
     if first:

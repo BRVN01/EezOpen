@@ -16,50 +16,159 @@ Licensed under the MIT License.
 See LICENSE for details.
 """
 
-# This script has a basic OBS Studios control.
-#
-# https://pypi.org/project/obsws-python/
-#
-# pip install obsws_python
-
 from __future__ import annotations
 
-import obsws_python as obs
 import argparse
+from pathlib import Path
+
+import obsws_python as obs
+
 
 class obsControl:
     def __init__(self):
-        
-        # Inicia argparse:
+
         parser = argparse.ArgumentParser()
-    
-        parser.add_argument("--start", action="store_true", help="Inicia a gravação.")
-        parser.add_argument("--pause", action="store_true", help="Pausa a gravação.")
-        parser.add_argument("--stop", action="store_true", help="Para a gravação.")
 
-        parser.add_argument("--audio", help="Usado para mutar e desmutar um audio.")
+        parser.add_argument(
+            "--config",
+            required=True,
+            help="Arquivo de configuração do OBS."
+        )
 
-        parser.add_argument("--scene", help="Usado para trocar de cena.")
+        parser.add_argument(
+            "--start",
+            action="store_true",
+            help="Inicia a gravação."
+        )
 
-        # Args recebe todos os argumentos do programa:
+        parser.add_argument(
+            "--pause",
+            action="store_true",
+            help="Pausa a gravação."
+        )
+
+        parser.add_argument(
+            "--stop",
+            action="store_true",
+            help="Para a gravação."
+        )
+
+        parser.add_argument(
+            "--audio",
+            help="Usado para mutar e desmutar um áudio."
+        )
+
+        parser.add_argument(
+            "--scene",
+            help="Usado para trocar de cena."
+        )
+
         self.args = parser.parse_args()
 
-        # Action recebe somente o argumento em 'command':
-        self.action = self.args
+        self.config = self.loadConfig(self.args.config)
 
         self.connectOBS()
 
+    def loadConfig(self, config_file):
+        """
+        Lê somente as opções necessárias para conexão com OBS:
+
+        obs-host
+        obs-port
+        obs-password
+
+        Todas as outras opções são ignoradas.
+        """
+
+        config_path = Path(config_file).expanduser()
+
+        if not config_path.is_file():
+            raise SystemExit(
+                f"Arquivo de configuração não encontrado: {config_path}"
+            )
+
+        config = {}
+
+        valid_options = {
+            "obs-host",
+            "obs-port",
+            "obs-password",
+        }
+
+        try:
+            with config_path.open("r", encoding="utf-8") as file:
+                for line in file:
+
+                    line = line.strip()
+
+                    # Ignora linhas vazias e comentários.
+                    if not line or line.startswith("#"):
+                        continue
+
+                    # Ignora linhas que não tenham "=".
+                    if "=" not in line:
+                        continue
+
+                    key, value = line.split("=", 1)
+
+                    key = key.strip()
+                    value = value.strip()
+
+                    # Ignora qualquer opção que não seja necessária.
+                    if key not in valid_options:
+                        continue
+
+                    config[key] = value
+
+        except OSError as error:
+            raise SystemExit(
+                f"Erro ao ler arquivo de configuração: {error}"
+            )
+
+        required_options = {
+            "obs-host",
+            "obs-port",
+            "obs-password",
+        }
+
+        missing = required_options - config.keys()
+
+        if missing:
+            raise SystemExit(
+                "Opções ausentes no arquivo de configuração: "
+                + ", ".join(sorted(missing))
+            )
+
+        try:
+            config["obs-port"] = int(config["obs-port"])
+        except ValueError:
+            raise SystemExit(
+                "A opção obs-port precisa ser um número inteiro."
+            )
+
+        return config
+
     def connectOBS(self):
-        self.control = obs.ReqClient(host='192.168.1.20', port=4444, password='abc123', timeout=3)
+
+        self.control = obs.ReqClient(
+            host=self.config["obs-host"],
+            port=self.config["obs-port"],
+            password=self.config["obs-password"],
+            timeout=3,
+        )
 
         if self.args.start:
             self.StartRecord()
+
         elif self.args.pause:
             self.TogglePauseRecord()
+
         elif self.args.stop:
             self.StopRecord()
+
         elif self.args.audio:
             self.ToggleMic()
+
         elif self.args.scene:
             self.ToggleScene()
 
@@ -79,12 +188,11 @@ class obsControl:
         self.control.set_current_program_scene(self.args.scene)
 
 
-if __name__ == '__main__':
-    a = obsControl()
+if __name__ == "__main__":
+    obsControl()
 
 
 # On Linux Ubuntu We can see all Custom Shortcuts using the command below:
-## dconf dump /org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/
-
-## After You have all Custom Shortcuts, You can back up '~/.config/dconf/user'.
-
+# dconf dump /org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/
+#
+# After You have all Custom Shortcuts, You can back up '~/.config/dconf/user'.
